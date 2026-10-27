@@ -1,0 +1,6 @@
+{
+  "name": "JLM Télévision H24",
+  "description": "Régie de diffusion continue 24h/24 et bot vocal Discord pour le direct Twitch jlmelenchon avec relais automatique des vidéos YouTube de Jean-Luc Mélenchon.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
