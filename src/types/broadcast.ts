@@ -22,6 +22,7 @@ export interface YouTubeVideoItem {
   durationSeconds: number;
   sourceType: 'rss' | 'custom';
   twitchVodId?: string;
+  twitchChannelLogin?: string;
 }
 
 export interface TransitionLog {

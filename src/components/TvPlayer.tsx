@@ -45,6 +45,8 @@ interface YTPlayerInstance {
   seekTo: (seconds: number, allowSeekAhead: boolean) => void;
   getCurrentTime: () => number;
   getDuration: () => number;
+  getPlayerState?: () => number;
+  setVolume: (volume: number) => void;
   mute: () => void;
   unMute: () => void;
   isMuted: () => boolean;
@@ -120,6 +122,7 @@ export function TvPlayer({
   onVideoError,
 }: TvPlayerProps) {
   const [isMuted, setIsMuted] = useState<boolean>(false);
+  const [volumePercent, setVolumePercent] = useState<number>(100);
   const [reloadNonce, setReloadNonce] = useState<number>(0);
   const [slateImgError, setSlateImgError] = useState<boolean>(false);
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
@@ -130,13 +133,17 @@ export function TvPlayer({
   const targetStartRef = useRef<number>(currentVideoStartedAt);
   const clockOffsetRef = useRef<number>(clockOffsetMs);
   const isMutedRef = useRef<boolean>(isMuted);
+  const volumePercentRef = useRef<number>(volumePercent);
 
   targetStartRef.current = currentVideoStartedAt;
   clockOffsetRef.current = clockOffsetMs;
   isMutedRef.current = isMuted;
+  volumePercentRef.current = volumePercent;
 
   const apiBase = isRunningInDiscordProxy() ? '/.proxy' : '';
-  const useHlsForYoutubeItem = Boolean(currentVideo?.twitchVodId);
+  const useHlsForYoutubeItem = Boolean(
+    currentVideo?.twitchVodId || currentVideo?.twitchChannelLogin
+  );
 
   useEffect(() => {
     const updateClock = () => {
@@ -173,6 +180,19 @@ export function TvPlayer({
       const serverNow = Date.now() + clockOffsetRef.current;
       const startSec = Math.max(0, Math.floor((serverNow - targetStartRef.current) / 1000));
 
+      const ensurePlayingOrMuteFallback = (player: YTPlayerInstance) => {
+        window.setTimeout(() => {
+          if (disposed || ytPlayerRef.current !== player) return;
+          const st = player.getPlayerState?.();
+          // 1 = PLAYING, 3 = BUFFERING
+          if (st !== 1 && st !== 3) {
+            player.mute();
+            setIsMuted(true);
+            player.playVideo();
+          }
+        }, 700);
+      };
+
       if (ytPlayerRef.current) {
         if (currentVideoIdRef.current !== currentVideo.id) {
           currentVideoIdRef.current = currentVideo.id;
@@ -180,6 +200,7 @@ export function TvPlayer({
             videoId: currentVideo.id,
             startSeconds: startSec,
           });
+          ensurePlayingOrMuteFallback(ytPlayerRef.current);
         } else {
           const currentPos = ytPlayerRef.current.getCurrentTime?.() ?? 0;
           if (Math.abs(currentPos - startSec) > 5) {
@@ -198,6 +219,7 @@ export function TvPlayer({
         videoId: currentVideo.id,
         playerVars: {
           autoplay: 1,
+          mute: isMutedRef.current ? 1 : 0,
           controls: 1,
           rel: 0,
           modestbranding: 1,
@@ -208,12 +230,14 @@ export function TvPlayer({
         events: {
           onReady: (e) => {
             if (disposed) return;
+            e.target.setVolume(volumePercentRef.current);
             if (isMutedRef.current) {
               e.target.mute();
             } else {
               e.target.unMute();
             }
             e.target.playVideo();
+            ensurePlayingOrMuteFallback(e.target);
             const dur = e.target.getDuration();
             if (dur > 0 && currentVideoIdRef.current) {
               onReportDuration(currentVideoIdRef.current, dur);
@@ -267,9 +291,30 @@ export function TvPlayer({
 
   const handleToggleMute = () => {
     const nextMuted = !isMuted;
+    const restoredVol = !nextMuted && volumePercent === 0 ? 50 : volumePercent;
+    if (!nextMuted && volumePercent === 0) {
+      setVolumePercent(50);
+    }
     setIsMuted(nextMuted);
     if (activeSource === 'youtube' && !useHlsForYoutubeItem && ytPlayerRef.current) {
       if (nextMuted) {
+        ytPlayerRef.current.mute();
+      } else {
+        ytPlayerRef.current.setVolume(restoredVol);
+        ytPlayerRef.current.unMute();
+        ytPlayerRef.current.playVideo();
+      }
+    }
+  };
+
+  const handleVolumeChange = (nextPercent: number) => {
+    const clamped = Math.max(0, Math.min(100, Math.round(nextPercent)));
+    setVolumePercent(clamped);
+    const muted = clamped === 0;
+    setIsMuted(muted);
+    if (activeSource === 'youtube' && !useHlsForYoutubeItem && ytPlayerRef.current) {
+      ytPlayerRef.current.setVolume(clamped);
+      if (muted) {
         ytPlayerRef.current.mute();
       } else {
         ytPlayerRef.current.unMute();
@@ -353,18 +398,22 @@ export function TvPlayer({
               isLive={true}
               targetStartSeconds={0}
               isMuted={isMuted}
-              volume={1}
+              volume={volumePercent / 100}
               reloadKey={reloadNonce}
               onMutedChange={setIsMuted}
             />
           )
-        ) : useHlsForYoutubeItem && currentVideo?.twitchVodId ? (
+        ) : useHlsForYoutubeItem && currentVideo ? (
           <HlsVideoStream
-            manifestUrl={`${apiBase}/api/hls/vod-${currentVideo.twitchVodId}.m3u8`}
-            isLive={false}
-            targetStartSeconds={targetVodStartSec}
+            manifestUrl={
+              currentVideo.twitchChannelLogin
+                ? `${apiBase}/api/hls/channel-${currentVideo.twitchChannelLogin}.m3u8`
+                : `${apiBase}/api/hls/vod-${currentVideo.twitchVodId}.m3u8`
+            }
+            isLive={Boolean(currentVideo.twitchChannelLogin)}
+            targetStartSeconds={currentVideo.twitchChannelLogin ? 0 : targetVodStartSec}
             isMuted={isMuted}
-            volume={1}
+            volume={volumePercent / 100}
             reloadKey={reloadNonce}
             onMutedChange={setIsMuted}
             onEnded={() => onVideoEnded(currentVideo.id)}
@@ -447,27 +496,33 @@ export function TvPlayer({
         </div>
 
         <div className="flex flex-wrap items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={handleToggleMute}
-            className={`inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-              isMuted
-                ? 'bg-rose-600 text-white hover:bg-rose-500'
-                : 'bg-slate-800 text-slate-200 hover:bg-slate-700 border border-slate-700'
-            }`}
-          >
-            {isMuted ? (
-              <>
-                <VolumeX className="w-4 h-4 shrink-0" />
-                <span>Activer le son</span>
-              </>
-            ) : (
-              <>
-                <Volume2 className="w-4 h-4 shrink-0" />
-                <span>Son actif</span>
-              </>
-            )}
-          </button>
+          <div className="inline-flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800">
+            <button
+              type="button"
+              onClick={handleToggleMute}
+              title={isMuted ? 'Activer le son' : 'Couper le son'}
+              className={`p-1 rounded transition-colors cursor-pointer ${
+                isMuted
+                  ? 'bg-rose-600 text-white hover:bg-rose-500'
+                  : 'text-slate-200 hover:text-white'
+              }`}
+            >
+              {isMuted ? <VolumeX className="w-4 h-4 shrink-0" /> : <Volume2 className="w-4 h-4 shrink-0" />}
+            </button>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={isMuted ? 0 : volumePercent}
+              onChange={(e) => handleVolumeChange(Number(e.target.value))}
+              aria-label="Volume sonore pourcent par pourcent"
+              className="w-24 sm:w-28 accent-rose-600 cursor-pointer"
+            />
+            <span className="w-9 text-right text-xs font-mono tabular-nums text-slate-300">
+              {isMuted ? 0 : volumePercent}%
+            </span>
+          </div>
 
           {activeSource === 'youtube' && (
             <>

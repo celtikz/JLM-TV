@@ -43,19 +43,75 @@ function extractYoutubeVideoId(input: string): string | null {
   try {
     const url = new URL(trimmed);
     if (url.hostname.includes('youtu.be')) {
-      const id = url.pathname.replace('/', '').slice(0, 11);
+      const id = url.pathname.replace(/^\//, '').split('/')[0].slice(0, 11);
       return /^[a-zA-Z0-9_-]{11}$/.test(id) ? id : null;
     }
     if (url.hostname.includes('youtube.com')) {
       const v = url.searchParams.get('v');
       if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v;
-      const shortsMatch = url.pathname.match(/\/(?:shorts|embed|live)\/([a-zA-Z0-9_-]{11})/);
-      if (shortsMatch) return shortsMatch[1];
+      const pathMatch = url.pathname.match(/\/(?:shorts|embed|live|v)\/([a-zA-Z0-9_-]{11})/);
+      if (pathMatch) return pathMatch[1];
     }
   } catch {
     return null;
   }
   return null;
+}
+
+function parseTwitchInput(
+  input: string
+): { kind: 'vod'; vodId: string } | { kind: 'channel'; login: string } | null {
+  const trimmed = input.trim();
+  if (/^\d{8,14}$/.test(trimmed)) {
+    return { kind: 'vod', vodId: trimmed };
+  }
+  try {
+    const url = new URL(trimmed);
+    if (!url.hostname.toLowerCase().includes('twitch.tv')) return null;
+    const parts = url.pathname.split('/').filter(Boolean);
+    if (parts[0] === 'videos' && parts[1] && /^\d+$/.test(parts[1])) {
+      return { kind: 'vod', vodId: parts[1] };
+    }
+    if (parts[1] === 'video' && parts[2] && /^\d+$/.test(parts[2])) {
+      return { kind: 'vod', vodId: parts[2] };
+    }
+    if (parts[0] && /^[a-zA-Z0-9_]{2,30}$/.test(parts[0]) && parts[0] !== 'videos') {
+      return { kind: 'channel', login: parts[0].toLowerCase() };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function normalizeWords(title: string): string[] {
+  return title
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 4 && !['jean', 'melenchon', 'avec', 'dans', 'pour'].includes(w));
+}
+
+function findMatchingTwitchArchive(youtubeTitle: string): YouTubeVideoItem | null {
+  const targetWords = normalizeWords(youtubeTitle);
+  if (targetWords.length < 2) return null;
+  let bestMatch: YouTubeVideoItem | null = null;
+  let bestRatio = 0;
+
+  for (const archive of cachedArchiveItems) {
+    if (!archive.twitchVodId) continue;
+    const archWords = new Set(normalizeWords(archive.title));
+    if (archWords.size === 0) continue;
+    const overlap = targetWords.filter((w) => archWords.has(w)).length;
+    const ratio = overlap / Math.min(targetWords.length, archWords.size);
+    if (overlap >= 2 && ratio >= 0.65 && ratio > bestRatio) {
+      bestRatio = ratio;
+      bestMatch = archive;
+    }
+  }
+  return bestMatch;
 }
 
 const FALLBACK_VIDEOS: YouTubeVideoItem[] = [
@@ -215,7 +271,9 @@ function advancePlaylist(reason: string, direction: 1 | -1 = 1, requireHls = fal
 
   const candidateIndices = state.playlist
     .map((item, idx) => ({ item, idx }))
-    .filter(({ item }) => !requireHls || Boolean(item.twitchVodId));
+    .filter(
+      ({ item }) => !requireHls || Boolean(item.twitchVodId || item.twitchChannelLogin)
+    );
 
   const pool =
     candidateIndices.length > 0
@@ -585,7 +643,7 @@ app.use((req, _res, next) => {
 });
 app.use(express.json());
 
-// HLS Live Stream Endpoint
+// HLS Live Stream Endpoint (Default JLM Channel)
 app.get('/api/hls/live.m3u8', async (_req, res) => {
   try {
     const tok = await fetchTwitchPlaybackToken({ isLive: true, login: TWITCH_LOGIN });
@@ -609,6 +667,40 @@ app.get('/api/hls/live.m3u8', async (_req, res) => {
   } catch (err) {
     console.error('[HLS Live Error]:', err);
     res.status(502).send('HLS live proxy error');
+  }
+});
+
+// HLS Live Stream Endpoint (Any Custom Twitch Channel)
+app.get('/api/hls/channel-:login.m3u8', async (req, res) => {
+  try {
+    const login = String(req.params.login || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9_]/g, '');
+    if (!login) {
+      res.status(400).send('Invalid channel login');
+      return;
+    }
+    const tok = await fetchTwitchPlaybackToken({ isLive: true, login });
+    if (!tok) {
+      res.status(404).send('Channel offline or token unavailable');
+      return;
+    }
+    const usherUrl = `https://usher.ttvnw.net/api/channel/hls/${login}.m3u8?sig=${encodeURIComponent(
+      tok.signature
+    )}&token=${encodeURIComponent(tok.value)}&allow_source=true&allow_audio_only=true&fast_bread=true`;
+
+    const upstream = await fetch(usherUrl);
+    if (!upstream.ok) {
+      res.status(upstream.status).send('Live stream currently offline');
+      return;
+    }
+    const text = await upstream.text();
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(rewriteM3u8Manifest(text, usherUrl));
+  } catch (err) {
+    console.error('[HLS Custom Channel Error]:', err);
+    res.status(502).send('HLS custom channel proxy error');
   }
 });
 
@@ -873,44 +965,7 @@ wss.on('connection', (socket) => {
         case 'playlist:add': {
           const rawUrl = String(msg.payload?.url || '');
           const playImmediately = Boolean(msg.payload?.playNow);
-          const videoId = extractYoutubeVideoId(rawUrl);
-          if (!videoId) break;
-
-          unplayableVideoIds.delete(videoId);
-          const existingIdx = state.playlist.findIndex((v) => v.id === videoId);
-          if (existingIdx === -1) {
-            const title = await fetchYoutubeOEmbedTitle(videoId);
-            const newItem: YouTubeVideoItem = {
-              id: videoId,
-              title,
-              publishedAt: new Date().toISOString(),
-              thumbnailUrl: `https://i2.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-              views: 0,
-              durationSeconds: durationCache.get(videoId) ?? 1800,
-              sourceType: 'custom',
-            };
-            state.playlist = [newItem, ...state.playlist];
-            if (playImmediately) {
-              state.currentIndex = 0;
-              state.currentVideoStartedAt = Date.now();
-              if (state.activeSource === 'twitch') {
-                state.mode = 'force_youtube';
-                state.activeSource = 'youtube';
-              }
-              appendTransition(`Diffusion immédiate ajoutée : ${title}`, 'youtube');
-            } else {
-              state.currentIndex += 1;
-              appendTransition(`Vidéo ajoutée à la grille : ${title}`, state.activeSource);
-            }
-          } else if (playImmediately) {
-            state.currentIndex = existingIdx;
-            state.currentVideoStartedAt = Date.now();
-            if (state.activeSource === 'twitch') {
-              state.mode = 'force_youtube';
-              state.activeSource = 'youtube';
-            }
-          }
-          broadcastFullState();
+          await addMediaItemToPlaylist(rawUrl, playImmediately);
           break;
         }
 
@@ -1028,8 +1083,331 @@ wss.on('connection', (socket) => {
   });
 });
 
+async function addMediaItemToPlaylist(
+  rawUrl: string,
+  playImmediately: boolean
+): Promise<{
+  ok: boolean;
+  discordSupported: boolean;
+  message: string;
+  item?: YouTubeVideoItem;
+}> {
+  const twitchParsed = parseTwitchInput(rawUrl);
+
+  // 1. Twitch VOD URL or numeric VOD ID
+  if (twitchParsed?.kind === 'vod') {
+    const vodId = twitchParsed.vodId;
+    const itemId = `vod-${vodId}`;
+    unplayableVideoIds.delete(itemId);
+
+    let title = `Rediffusion Twitch #${vodId}`;
+    let durationSeconds = 3600;
+    let thumbnailUrl = '';
+    let views = 0;
+    let publishedAt = new Date().toISOString();
+
+    try {
+      const gqlRes = await fetch('https://gql.twitch.tv/gql', {
+        method: 'POST',
+        headers: {
+          'Client-Id': TWITCH_PUBLIC_CLIENT_ID,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: `query {
+            video(id: "${vodId}") {
+              id
+              title
+              lengthSeconds
+              publishedAt
+              viewCount
+              previewThumbnailURL(width: 640, height: 360)
+            }
+          }`,
+        }),
+      });
+      if (gqlRes.ok) {
+        const json = (await gqlRes.json()) as {
+          data?: {
+            video?: {
+              title?: string;
+              lengthSeconds?: number;
+              publishedAt?: string;
+              viewCount?: number;
+              previewThumbnailURL?: string;
+            } | null;
+          };
+        };
+        const v = json?.data?.video;
+        if (!v?.lengthSeconds) {
+          return {
+            ok: false,
+            discordSupported: false,
+            message: 'Cette vidéo Twitch est introuvable ou privée.',
+          };
+        }
+        title = v.title || title;
+        durationSeconds = v.lengthSeconds;
+        thumbnailUrl = v.previewThumbnailURL || '';
+        views = v.viewCount ?? 0;
+        publishedAt = v.publishedAt || publishedAt;
+      }
+    } catch {
+      // Fallback defaults
+    }
+
+    const newItem: YouTubeVideoItem = {
+      id: itemId,
+      twitchVodId: vodId,
+      title,
+      publishedAt,
+      thumbnailUrl,
+      views,
+      durationSeconds,
+      sourceType: 'custom',
+    };
+
+    const existingIdx = state.playlist.findIndex((v) => v.id === itemId);
+    if (existingIdx === -1) {
+      state.playlist = [newItem, ...state.playlist];
+      if (playImmediately) {
+        state.currentIndex = 0;
+      } else {
+        state.currentIndex += 1;
+      }
+    } else if (playImmediately) {
+      state.currentIndex = existingIdx;
+    }
+
+    if (playImmediately) {
+      state.currentVideoStartedAt =
+        Date.now() - getProgramEntryOffsetSeconds(newItem) * 1000;
+      if (state.activeSource === 'twitch') {
+        state.mode = 'force_youtube';
+        state.activeSource = 'youtube';
+      }
+      appendTransition(`Diffusion immédiate Twitch VOD : ${title}`, 'youtube');
+    } else {
+      appendTransition(`Vidéo Twitch ajoutée à la grille : ${title}`, state.activeSource);
+    }
+
+    broadcastFullState();
+    return {
+      ok: true,
+      discordSupported: true,
+      message: playImmediately
+        ? `À l’antenne sur le site et sur Discord : ${title}`
+        : `Ajouté à la grille (compatible Discord) : ${title}`,
+      item: newItem,
+    };
+  }
+
+  // 2. Twitch Channel URL (Live stream or fallback to latest archive)
+  if (twitchParsed?.kind === 'channel') {
+    const login = twitchParsed.login;
+    try {
+      const gqlRes = await fetch('https://gql.twitch.tv/gql', {
+        method: 'POST',
+        headers: {
+          'Client-Id': TWITCH_PUBLIC_CLIENT_ID,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: `query {
+            user(login: "${login}") {
+              login
+              displayName
+              profileImageURL(width: 300)
+              stream { id title type }
+              videos(first: 1, type: ARCHIVE) {
+                edges {
+                  node {
+                    id
+                    title
+                    lengthSeconds
+                    publishedAt
+                    viewCount
+                    previewThumbnailURL(width: 640, height: 360)
+                  }
+                }
+              }
+            }
+          }`,
+        }),
+      });
+      const json = (await gqlRes.json()) as {
+        data?: {
+          user?: {
+            login?: string;
+            displayName?: string;
+            profileImageURL?: string;
+            stream?: { id?: string; title?: string; type?: string } | null;
+            videos?: {
+              edges?: Array<{
+                node?: {
+                  id?: string;
+                  title?: string;
+                  lengthSeconds?: number;
+                  publishedAt?: string;
+                  viewCount?: number;
+                  previewThumbnailURL?: string;
+                };
+              }>;
+            };
+          } | null;
+        };
+      };
+      const u = json?.data?.user;
+      if (!u) {
+        return {
+          ok: false,
+          discordSupported: false,
+          message: `La chaîne Twitch "${login}" est introuvable.`,
+        };
+      }
+
+      if (u.stream && u.stream.type === 'live') {
+        const itemId = `channel-${login}`;
+        const liveTitle = `DIRECT · ${u.displayName || login} — ${u.stream.title || 'En direct'}`;
+        const newItem: YouTubeVideoItem = {
+          id: itemId,
+          twitchChannelLogin: login,
+          title: liveTitle,
+          publishedAt: new Date().toISOString(),
+          thumbnailUrl: u.profileImageURL || '',
+          views: 0,
+          durationSeconds: 43200,
+          sourceType: 'custom',
+        };
+        const existingIdx = state.playlist.findIndex((v) => v.id === itemId);
+        if (existingIdx === -1) {
+          state.playlist = [newItem, ...state.playlist];
+          state.currentIndex = playImmediately ? 0 : state.currentIndex + 1;
+        } else if (playImmediately) {
+          state.currentIndex = existingIdx;
+        }
+        if (playImmediately) {
+          state.currentVideoStartedAt = Date.now();
+          state.mode = 'force_youtube';
+          state.activeSource = 'youtube';
+          appendTransition(`Direct Twitch lancé : ${liveTitle}`, 'youtube');
+        }
+        broadcastFullState();
+        return {
+          ok: true,
+          discordSupported: true,
+          message: `Direct Twitch "${u.displayName || login}" diffusé sur le site et sur Discord !`,
+          item: newItem,
+        };
+      }
+
+      const latestVod = u.videos?.edges?.[0]?.node;
+      if (latestVod?.id && latestVod.lengthSeconds) {
+        return addMediaItemToPlaylist(
+          `https://www.twitch.tv/videos/${latestVod.id}`,
+          playImmediately
+        );
+      }
+
+      return {
+        ok: false,
+        discordSupported: false,
+        message: `La chaîne Twitch "${login}" n’est pas en direct et n’a aucune rediffusion publique.`,
+      };
+    } catch {
+      return {
+        ok: false,
+        discordSupported: false,
+        message: 'Impossible de contacter Twitch pour cette chaîne.',
+      };
+    }
+  }
+
+  // 3. YouTube Video URL or 11-char ID
+  const videoId = extractYoutubeVideoId(rawUrl);
+  if (!videoId) {
+    return {
+      ok: false,
+      discordSupported: false,
+      message:
+        'Lien non reconnu. Collez un lien YouTube (watch?v=...) ou un lien Twitch (twitch.tv/videos/... ou twitch.tv/chaine).',
+    };
+  }
+
+  unplayableVideoIds.delete(videoId);
+  const title = await fetchYoutubeOEmbedTitle(videoId);
+  const matchedTwitchArchive = findMatchingTwitchArchive(title);
+
+  const existingIdx = state.playlist.findIndex((v) => v.id === videoId);
+  const newItem: YouTubeVideoItem = {
+    id: videoId,
+    twitchVodId: matchedTwitchArchive?.twitchVodId,
+    title,
+    publishedAt: new Date().toISOString(),
+    thumbnailUrl: `https://i2.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    views: matchedTwitchArchive?.views ?? 0,
+    durationSeconds:
+      matchedTwitchArchive?.durationSeconds ?? (durationCache.get(videoId) ?? 1800),
+    sourceType: 'custom',
+  };
+
+  if (existingIdx === -1) {
+    state.playlist = [newItem, ...state.playlist];
+    if (playImmediately) {
+      state.currentIndex = 0;
+    } else {
+      state.currentIndex += 1;
+    }
+  } else {
+    state.playlist[existingIdx] = {
+      ...state.playlist[existingIdx],
+      twitchVodId: matchedTwitchArchive?.twitchVodId || state.playlist[existingIdx].twitchVodId,
+    };
+    if (playImmediately) {
+      state.currentIndex = existingIdx;
+    }
+  }
+
+  if (playImmediately) {
+    state.currentVideoStartedAt = matchedTwitchArchive
+      ? Date.now() - getProgramEntryOffsetSeconds(newItem) * 1000
+      : Date.now();
+    if (state.activeSource === 'twitch') {
+      state.mode = 'force_youtube';
+      state.activeSource = 'youtube';
+    }
+    appendTransition(`Diffusion immédiate : ${title}`, 'youtube');
+  } else {
+    appendTransition(`Vidéo ajoutée à la grille : ${title}`, state.activeSource);
+  }
+
+  broadcastFullState();
+
+  const discordSupported = Boolean(newItem.twitchVodId);
+  return {
+    ok: true,
+    discordSupported,
+    message: discordSupported
+      ? `À l’antenne sur le site et sur Discord : ${title}`
+      : playImmediately
+        ? `En lecture sur le site web (${title}). Note : Discord bloque les chaînes YouTube externes dans les activités — utilisez un lien Twitch pour l’afficher aussi dans Discord.`
+        : `Ajouté à la grille web : ${title}`,
+    item: newItem,
+  };
+}
+
 app.get('/api/tv/state', (_req, res) => {
   res.json(getPublicState());
+});
+
+app.post('/api/tv/playlist/add', async (req, res) => {
+  const rawUrl = String(req.body?.url || '');
+  const playNow = Boolean(req.body?.playNow);
+  const result = await addMediaItemToPlaylist(rawUrl, playNow);
+  res.status(result.ok ? 200 : 400).json({
+    ...result,
+    state: getPublicState(),
+  });
 });
 
 app.post('/api/tv/probe', async (_req, res) => {

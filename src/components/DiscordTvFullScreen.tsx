@@ -11,6 +11,7 @@ import {
   Radio,
   Tv,
   Minimize2,
+  Play,
 } from 'lucide-react';
 import type { BroadcastMode, BroadcastState } from '../types/broadcast';
 import { HlsVideoStream } from './HlsVideoStream';
@@ -37,6 +38,7 @@ interface DiscordTvFullScreenProps {
   onNext: () => void;
   onSeekSeconds: (seconds: number) => void;
   onSelectVideo: (videoId: string) => void;
+  onAddMediaNow: (url: string) => Promise<{ ok: boolean; message: string }>;
   onVideoEnded: (videoId: string) => void;
   onVideoError: (videoId: string) => void;
 }
@@ -51,32 +53,50 @@ export function DiscordTvFullScreen({
   onNext,
   onSeekSeconds,
   onSelectVideo,
+  onAddMediaNow,
   onVideoEnded,
   onVideoError,
 }: DiscordTvFullScreenProps) {
   const [isMuted, setIsMuted] = useState<boolean>(false);
-  const [volume, setVolume] = useState<number>(1);
+  const [volumePercent, setVolumePercent] = useState<number>(100);
   const [reloadNonce, setReloadNonce] = useState<number>(0);
   const [controlsVisible, setControlsVisible] = useState<boolean>(true);
   const [drawerOpen, setDrawerOpen] = useState<boolean>(false);
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
+  const [customLinkInput, setCustomLinkInput] = useState<string>('');
+  const [customLinkStatus, setCustomLinkStatus] = useState<string | null>(null);
+  const [isSubmittingLink, setIsSubmittingLink] = useState<boolean>(false);
 
   const hideTimerRef = useRef<number | null>(null);
   const apiBase = isRunningInDiscordProxy() ? '/.proxy' : '';
 
   const hlsCompatiblePlaylist = useMemo(
-    () => broadcast.playlist.filter((v) => Boolean(v.twitchVodId)),
+    () =>
+      broadcast.playlist.filter((v) =>
+        Boolean(v.twitchVodId || v.twitchChannelLogin)
+      ),
     [broadcast.playlist]
   );
 
+  const rawSelectedItem = broadcast.playlist[broadcast.currentIndex] || null;
+  const isRawYoutubeOnly = Boolean(
+    rawSelectedItem &&
+      !rawSelectedItem.twitchVodId &&
+      !rawSelectedItem.twitchChannelLogin &&
+      !(broadcast.activeSource === 'twitch' && broadcast.twitch.isLive)
+  );
+
   const activeVodItem = useMemo(() => {
-    const rawCurrent = broadcast.playlist[broadcast.currentIndex];
-    if (rawCurrent?.twitchVodId) return rawCurrent;
+    if (rawSelectedItem?.twitchVodId || rawSelectedItem?.twitchChannelLogin) {
+      return rawSelectedItem;
+    }
     return hlsCompatiblePlaylist[0] || null;
-  }, [broadcast.playlist, broadcast.currentIndex, hlsCompatiblePlaylist]);
+  }, [rawSelectedItem, hlsCompatiblePlaylist]);
 
   const isPlayingTwitchLive =
     broadcast.activeSource === 'twitch' && broadcast.twitch.isLive;
+  const isLiveStream =
+    isPlayingTwitchLive || Boolean(activeVodItem?.twitchChannelLogin);
 
   useEffect(() => {
     const tick = () => {
@@ -109,14 +129,22 @@ export function DiscordTvFullScreen({
     if (isPlayingTwitchLive) {
       return `${apiBase}/api/hls/live.m3u8`;
     }
+    if (activeVodItem?.twitchChannelLogin) {
+      return `${apiBase}/api/hls/channel-${activeVodItem.twitchChannelLogin}.m3u8`;
+    }
     if (activeVodItem?.twitchVodId) {
       return `${apiBase}/api/hls/vod-${activeVodItem.twitchVodId}.m3u8`;
     }
     return '';
-  }, [apiBase, isPlayingTwitchLive, activeVodItem?.twitchVodId]);
+  }, [
+    apiBase,
+    isPlayingTwitchLive,
+    activeVodItem?.twitchChannelLogin,
+    activeVodItem?.twitchVodId,
+  ]);
 
   const targetStartSec = useMemo(() => {
-    if (isPlayingTwitchLive || !activeVodItem) return 0;
+    if (isLiveStream || !activeVodItem) return 0;
     const serverNow = Date.now() + clockOffsetMs;
     const rawElapsed = Math.max(
       0,
@@ -126,13 +154,30 @@ export function DiscordTvFullScreen({
       ? rawElapsed % activeVodItem.durationSeconds
       : rawElapsed;
   }, [
-    isPlayingTwitchLive,
+    isLiveStream,
     activeVodItem?.id,
     activeVodItem?.durationSeconds,
     broadcast.currentVideoStartedAt,
     clockOffsetMs,
     reloadNonce,
   ]);
+
+  const handleDirectLinkSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = customLinkInput.trim();
+    if (!trimmed || isSubmittingLink) return;
+    setIsSubmittingLink(true);
+    try {
+      const res = await onAddMediaNow(trimmed);
+      setCustomLinkStatus(res.message);
+      if (res.ok) {
+        setCustomLinkInput('');
+      }
+      window.setTimeout(() => setCustomLinkStatus(null), 5000);
+    } finally {
+      setIsSubmittingLink(false);
+    }
+  };
 
   const showOverlay = controlsVisible || drawerOpen || isMuted;
 
@@ -146,10 +191,10 @@ export function DiscordTvFullScreen({
       {manifestUrl ? (
         <HlsVideoStream
           manifestUrl={manifestUrl}
-          isLive={isPlayingTwitchLive}
+          isLive={isLiveStream}
           targetStartSeconds={targetStartSec}
           isMuted={isMuted}
-          volume={volume}
+          volume={volumePercent / 100}
           reloadKey={reloadNonce}
           onMutedChange={setIsMuted}
           onEnded={() => {
@@ -177,11 +222,14 @@ export function DiscordTvFullScreen({
       >
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 space-y-1">
-            <div className="flex items-center gap-2 text-xs text-slate-300">
-              {isPlayingTwitchLive ? (
+            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-300">
+              {isLiveStream ? (
                 <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-400">
                   <Radio className="w-3.5 h-3.5 shrink-0" />
-                  EN DIRECT · Twitch jlmelenchon
+                  EN DIRECT ·{' '}
+                  {isPlayingTwitchLive
+                    ? 'Twitch jlmelenchon'
+                    : `Twitch ${activeVodItem?.twitchChannelLogin}`}
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1.5 font-semibold text-rose-400">
@@ -194,6 +242,14 @@ export function DiscordTvFullScreen({
                 <Users className="w-3.5 h-3.5 shrink-0" />
                 {broadcast.connectedViewers}
               </span>
+              {isRawYoutubeOnly && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-amber-300">
+                    Flux Twitch maintenu sur Discord (YouTube externe actif sur le web)
+                  </span>
+                </>
+              )}
             </div>
             <h1 className="text-sm sm:text-base font-semibold text-white truncate max-w-2xl">
               {isPlayingTwitchLive
@@ -221,7 +277,7 @@ export function DiscordTvFullScreen({
           showOverlay ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       >
-        {!isPlayingTwitchLive && activeVodItem && activeVodItem.durationSeconds > 0 && (
+        {!isLiveStream && activeVodItem && activeVodItem.durationSeconds > 0 && (
           <div
             onClick={(e) => {
               e.stopPropagation();
@@ -241,11 +297,19 @@ export function DiscordTvFullScreen({
         )}
 
         <div className="flex flex-wrap items-center justify-between gap-3">
-          {/* Audio + Timecode */}
-          <div className="flex items-center gap-3">
+          {/* Audio (1% by 1% precision slider) + Timecode */}
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="flex items-center gap-2.5"
+          >
             <button
               type="button"
-              onClick={() => setIsMuted((m) => !m)}
+              onClick={() => {
+                if (isMuted && volumePercent === 0) {
+                  setVolumePercent(50);
+                }
+                setIsMuted((m) => !m);
+              }}
               className="p-2 rounded-lg bg-slate-900/85 hover:bg-slate-800 border border-slate-700/80 text-white transition-colors cursor-pointer"
               title={isMuted ? 'Activer le son' : 'Couper le son'}
             >
@@ -255,20 +319,24 @@ export function DiscordTvFullScreen({
             <input
               type="range"
               min={0}
-              max={1}
-              step={0.05}
-              value={isMuted ? 0 : volume}
+              max={100}
+              step={1}
+              value={isMuted ? 0 : volumePercent}
               onChange={(e) => {
-                const v = Number(e.target.value);
-                setVolume(v);
-                setIsMuted(v === 0);
+                const pct = Math.max(0, Math.min(100, Math.round(Number(e.target.value))));
+                setVolumePercent(pct);
+                setIsMuted(pct === 0);
               }}
-              aria-label="Volume sonore"
-              className="w-20 sm:w-24 accent-rose-600 cursor-pointer"
+              aria-label="Volume sonore pourcent par pourcent"
+              className="w-28 sm:w-36 accent-rose-600 cursor-pointer"
             />
 
-            {!isPlayingTwitchLive && activeVodItem && (
-              <span className="text-xs font-mono tabular-nums text-slate-300 pl-1">
+            <span className="w-9 text-right text-xs font-mono tabular-nums text-slate-200">
+              {isMuted ? 0 : volumePercent}%
+            </span>
+
+            {!isLiveStream && activeVodItem && (
+              <span className="text-xs font-mono tabular-nums text-slate-300 pl-1.5">
                 {formatTimecode(elapsedSeconds % Math.max(1, activeVodItem.durationSeconds))} /{' '}
                 {formatTimecode(activeVodItem.durationSeconds)}
               </span>
@@ -281,29 +349,38 @@ export function DiscordTvFullScreen({
               <>
                 <button
                   type="button"
-                  onClick={onPrev}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onPrev();
+                  }}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-200 bg-slate-900/85 hover:bg-slate-800 border border-slate-700/80 rounded-lg transition-colors cursor-pointer whitespace-nowrap"
                 >
                   <SkipBack className="w-3.5 h-3.5 shrink-0" />
                   <span className="hidden sm:inline">Précédent</span>
                 </button>
+                {!isLiveStream && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (activeVodItem) {
+                        const pos =
+                          elapsedSeconds % Math.max(1, activeVodItem.durationSeconds);
+                        onSeekSeconds(pos + 300);
+                      }
+                    }}
+                    title="Avancer de 5 minutes"
+                    className="inline-flex items-center px-2.5 py-1.5 text-xs font-mono font-medium text-slate-200 bg-slate-900/85 hover:bg-slate-800 border border-slate-700/80 rounded-lg transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    +5m
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();
-                    if (activeVodItem) {
-                      const pos = elapsedSeconds % Math.max(1, activeVodItem.durationSeconds);
-                      onSeekSeconds(pos + 300);
-                    }
+                    onNext();
                   }}
-                  title="Avancer de 5 minutes"
-                  className="inline-flex items-center px-2.5 py-1.5 text-xs font-mono font-medium text-slate-200 bg-slate-900/85 hover:bg-slate-800 border border-slate-700/80 rounded-lg transition-colors cursor-pointer whitespace-nowrap"
-                >
-                  +5m
-                </button>
-                <button
-                  type="button"
-                  onClick={onNext}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-200 bg-slate-900/85 hover:bg-slate-800 border border-slate-700/80 rounded-lg transition-colors cursor-pointer whitespace-nowrap"
                 >
                   <span className="hidden sm:inline">Suivant</span>
@@ -314,7 +391,10 @@ export function DiscordTvFullScreen({
 
             <button
               type="button"
-              onClick={() => setReloadNonce((n) => n + 1)}
+              onClick={(e) => {
+                e.stopPropagation();
+                setReloadNonce((n) => n + 1);
+              }}
               title="Resynchroniser sur le direct"
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-200 bg-slate-900/85 hover:bg-slate-800 border border-slate-700/80 rounded-lg transition-colors cursor-pointer whitespace-nowrap"
             >
@@ -324,7 +404,10 @@ export function DiscordTvFullScreen({
 
             <button
               type="button"
-              onClick={() => setDrawerOpen((o) => !o)}
+              onClick={(e) => {
+                e.stopPropagation();
+                setDrawerOpen((o) => !o);
+              }}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-rose-600/90 hover:bg-rose-500 rounded-lg transition-colors cursor-pointer whitespace-nowrap"
             >
               <ListVideo className="w-3.5 h-3.5 shrink-0" />
@@ -336,7 +419,10 @@ export function DiscordTvFullScreen({
 
       {/* Compact Slide-Over Program Guide Drawer */}
       {drawerOpen && (
-        <div className="absolute top-0 right-0 bottom-0 w-full max-w-sm bg-slate-950/95 border-l border-slate-800 z-30 flex flex-col">
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="absolute top-0 right-0 bottom-0 w-full max-w-sm bg-slate-950/95 border-l border-slate-800 z-30 flex flex-col"
+        >
           <div className="px-4 py-3.5 border-b border-slate-800 flex items-center justify-between gap-2">
             <div>
               <h2 className="text-sm font-semibold text-white">Choix du programme TV</h2>
@@ -378,6 +464,36 @@ export function DiscordTvFullScreen({
             </button>
           </div>
 
+          {/* Direct Launch Box inside Discord Activity */}
+          <form
+            onSubmit={handleDirectLinkSubmit}
+            className="p-3.5 border-b border-slate-800 bg-slate-900/40 space-y-2"
+          >
+            <label className="block text-[11px] font-medium text-slate-300">
+              Diffuser un direct ou une rediffusion Twitch maintenant
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={customLinkInput}
+                onChange={(e) => setCustomLinkInput(e.target.value)}
+                placeholder="https://www.twitch.tv/..."
+                className="flex-1 min-w-0 px-2.5 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
+              />
+              <button
+                type="submit"
+                disabled={isSubmittingLink}
+                className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-white bg-rose-600 hover:bg-rose-500 rounded-lg transition-colors cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                <Play className="w-3 h-3 fill-current shrink-0" />
+                <span>Lancer</span>
+              </button>
+            </div>
+            {customLinkStatus && (
+              <p className="text-[11px] text-amber-300 leading-snug">{customLinkStatus}</p>
+            )}
+          </form>
+
           <div className="flex-1 overflow-y-auto divide-y divide-slate-800/70">
             {hlsCompatiblePlaylist.map((item, idx) => {
               const isSelected = activeVodItem?.id === item.id && !isPlayingTwitchLive;
@@ -401,8 +517,9 @@ export function DiscordTvFullScreen({
                       {item.title}
                     </p>
                     <p className="text-[11px] font-mono tabular-nums text-slate-400">
-                      Durée {formatTimecode(item.durationSeconds)} ·{' '}
-                      {item.views.toLocaleString('fr-FR')} vues
+                      {item.twitchChannelLogin
+                        ? `Direct Twitch · ${item.twitchChannelLogin}`
+                        : `Durée ${formatTimecode(item.durationSeconds)} · ${item.views.toLocaleString('fr-FR')} vues`}
                     </p>
                   </div>
                 </button>

@@ -73,6 +73,8 @@ export default function App() {
   const [sourceFilter, setSourceFilter] = useState<'all' | 'rss' | 'custom'>('all');
   const [customYoutubeUrl, setCustomYoutubeUrl] = useState<string>('');
   const [addStatusMsg, setAddStatusMsg] = useState<string | null>(null);
+  const [addStatusTone, setAddStatusTone] = useState<'ok' | 'warn' | 'err'>('ok');
+  const [isAddingMedia, setIsAddingMedia] = useState<boolean>(false);
 
   // Live Salon Chat
   const [authorName, setAuthorName] = useState<string>(() => {
@@ -237,17 +239,52 @@ export default function App() {
     [sendWsAction]
   );
 
-  const handleAddYoutubeVideo = (playNow: boolean) => {
+  const submitMediaUrl = useCallback(
+    async (rawUrl: string, playNow: boolean): Promise<{ ok: boolean; message: string }> => {
+      const apiBase = isRunningInDiscordProxy() ? '/.proxy' : '';
+      try {
+        const res = await fetch(`${apiBase}/api/tv/playlist/add`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: rawUrl, playNow }),
+        });
+        const data = (await res.json()) as {
+          ok: boolean;
+          discordSupported?: boolean;
+          message: string;
+          state?: BroadcastState;
+        };
+        if (data.state) {
+          setBroadcast(data.state);
+          setClockOffsetMs(data.state.serverTime - Date.now());
+        }
+        setAddStatusTone(!data.ok ? 'err' : data.discordSupported === false ? 'warn' : 'ok');
+        setAddStatusMsg(data.message);
+        window.setTimeout(() => setAddStatusMsg(null), 6500);
+        return { ok: data.ok, message: data.message };
+      } catch {
+        const fallbackMsg = 'Erreur réseau lors de l’envoi du lien à la régie.';
+        setAddStatusTone('err');
+        setAddStatusMsg(fallbackMsg);
+        window.setTimeout(() => setAddStatusMsg(null), 5000);
+        return { ok: false, message: fallbackMsg };
+      }
+    },
+    []
+  );
+
+  const handleAddYoutubeVideo = async (playNow: boolean) => {
     const trimmed = customYoutubeUrl.trim();
-    if (!trimmed) return;
-    sendWsAction('playlist:add', { url: trimmed, playNow });
-    setCustomYoutubeUrl('');
-    setAddStatusMsg(
-      playNow
-        ? 'Vidéo envoyée à l’antenne en direct.'
-        : 'Vidéo ajoutée en haut de la grille YouTube.'
-    );
-    window.setTimeout(() => setAddStatusMsg(null), 3000);
+    if (!trimmed || isAddingMedia) return;
+    setIsAddingMedia(true);
+    try {
+      const res = await submitMediaUrl(trimmed, playNow);
+      if (res.ok) {
+        setCustomYoutubeUrl('');
+      }
+    } finally {
+      setIsAddingMedia(false);
+    }
   };
 
   const handleSendChat = (e: React.FormEvent) => {
@@ -310,6 +347,7 @@ export default function App() {
         onNext={() => sendWsAction('playlist:next', { requireHls: true })}
         onSeekSeconds={(seconds) => sendWsAction('video:seek', { seconds })}
         onSelectVideo={(videoId) => sendWsAction('playlist:select', { videoId })}
+        onAddMediaNow={(url) => submitMediaUrl(url, true)}
         onVideoEnded={handleVideoEnded}
         onVideoError={handleVideoError}
       />
@@ -497,43 +535,61 @@ export default function App() {
                   onVideoError={handleVideoError}
                 />
 
-                {/* Quick Add Custom YouTube Video to Live Broadcast */}
+                {/* Quick Add Custom Twitch or YouTube Video to Live Broadcast */}
                 <div className="border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <h3 className="text-sm font-semibold text-white">
-                      Lancer ou programmer une vidéo YouTube immédiatement
+                      Lancer ou programmer un direct / une vidéo immédiatement (Twitch ou YouTube)
                     </h3>
-                    {addStatusMsg && (
-                      <span className="text-xs text-emerald-400">{addStatusMsg}</span>
-                    )}
                   </div>
                   <div className="flex flex-col sm:flex-row gap-2.5">
                     <input
                       type="text"
                       value={customYoutubeUrl}
                       onChange={(e) => setCustomYoutubeUrl(e.target.value)}
-                      placeholder="Coller un lien YouTube (ex. https://www.youtube.com/watch?v=...)"
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          void handleAddYoutubeVideo(true);
+                        }
+                      }}
+                      placeholder="Coller un lien Twitch (vidéo ou chaîne live -> Web + Discord) ou YouTube..."
                       className="flex-1 px-3.5 py-2 text-sm bg-slate-950 border border-slate-800 rounded-lg text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
                     />
                     <div className="flex items-center gap-2 shrink-0">
                       <button
                         type="button"
-                        onClick={() => handleAddYoutubeVideo(true)}
-                        className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-rose-600 hover:bg-rose-500 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                        disabled={isAddingMedia}
+                        onClick={() => void handleAddYoutubeVideo(true)}
+                        className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-rose-600 hover:bg-rose-500 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                       >
                         <Play className="w-3.5 h-3.5 shrink-0" />
-                        <span>Diffuser maintenant</span>
+                        <span>{isAddingMedia ? 'Envoi...' : 'Diffuser maintenant'}</span>
                       </button>
                       <button
                         type="button"
-                        onClick={() => handleAddYoutubeVideo(false)}
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                        disabled={isAddingMedia}
+                        onClick={() => void handleAddYoutubeVideo(false)}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                       >
                         <Plus className="w-3.5 h-3.5 shrink-0" />
                         <span>Ajouter à la file</span>
                       </button>
                     </div>
                   </div>
+                  {addStatusMsg && (
+                    <p
+                      className={`text-xs leading-relaxed ${
+                        addStatusTone === 'err'
+                          ? 'text-rose-400'
+                          : addStatusTone === 'warn'
+                            ? 'text-amber-300'
+                            : 'text-emerald-400'
+                      }`}
+                    >
+                      {addStatusMsg}
+                    </p>
+                  )}
                 </div>
               </div>
 
@@ -763,22 +819,53 @@ export default function App() {
                 />
               </div>
 
-              <div className="lg:col-span-7 flex flex-col sm:flex-row gap-2.5">
-                <input
-                  type="text"
-                  value={customYoutubeUrl}
-                  onChange={(e) => setCustomYoutubeUrl(e.target.value)}
-                  placeholder="Ajouter une vidéo YouTube par URL ou ID (11 caractères)..."
-                  className="flex-1 px-3.5 py-2.5 text-sm bg-slate-900 border border-slate-800 rounded-lg text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
-                />
-                <button
-                  type="button"
-                  onClick={() => handleAddYoutubeVideo(false)}
-                  className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 text-xs font-medium text-white bg-rose-600 hover:bg-rose-500 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  <Plus className="w-4 h-4 shrink-0" />
-                  <span>Ajouter à la grille</span>
-                </button>
+              <div className="lg:col-span-7 flex flex-col gap-2">
+                <div className="flex flex-col sm:flex-row gap-2.5">
+                  <input
+                    type="text"
+                    value={customYoutubeUrl}
+                    onChange={(e) => setCustomYoutubeUrl(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        void handleAddYoutubeVideo(true);
+                      }
+                    }}
+                    placeholder="Lien Twitch (live/VOD) ou YouTube..."
+                    className="flex-1 px-3.5 py-2.5 text-sm bg-slate-900 border border-slate-800 rounded-lg text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
+                  />
+                  <button
+                    type="button"
+                    disabled={isAddingMedia}
+                    onClick={() => void handleAddYoutubeVideo(true)}
+                    className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 text-xs font-medium text-white bg-rose-600 hover:bg-rose-500 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Play className="w-3.5 h-3.5 shrink-0" />
+                    <span>{isAddingMedia ? 'Chargement...' : 'Diffuser maintenant'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isAddingMedia}
+                    onClick={() => void handleAddYoutubeVideo(false)}
+                    className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Plus className="w-4 h-4 shrink-0" />
+                    <span>Ajouter à la grille</span>
+                  </button>
+                </div>
+                {addStatusMsg && (
+                  <p
+                    className={`text-xs ${
+                      addStatusTone === 'err'
+                        ? 'text-rose-400'
+                        : addStatusTone === 'warn'
+                          ? 'text-amber-300'
+                          : 'text-emerald-400'
+                    }`}
+                  >
+                    {addStatusMsg}
+                  </p>
+                )}
               </div>
             </div>
 
