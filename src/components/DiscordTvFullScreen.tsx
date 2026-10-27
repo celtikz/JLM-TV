@@ -35,6 +35,7 @@ interface DiscordTvFullScreenProps {
   onSetMode: (mode: BroadcastMode) => void;
   onPrev: () => void;
   onNext: () => void;
+  onSeekSeconds: (seconds: number) => void;
   onSelectVideo: (videoId: string) => void;
   onVideoEnded: (videoId: string) => void;
   onVideoError: (videoId: string) => void;
@@ -48,6 +49,7 @@ export function DiscordTvFullScreen({
   onSetMode,
   onPrev,
   onNext,
+  onSeekSeconds,
   onSelectVideo,
   onVideoEnded,
   onVideoError,
@@ -219,6 +221,25 @@ export function DiscordTvFullScreen({
           showOverlay ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       >
+        {!isPlayingTwitchLive && activeVodItem && activeVodItem.durationSeconds > 0 && (
+          <div
+            onClick={(e) => {
+              e.stopPropagation();
+              const rect = e.currentTarget.getBoundingClientRect();
+              const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+              onSeekSeconds(Math.round(ratio * activeVodItem.durationSeconds));
+            }}
+            className="h-1.5 hover:h-2.5 w-full bg-white/20 rounded-full overflow-hidden mb-3 cursor-pointer transition-all"
+            title="Cliquer pour avancer ou reculer dans la vidéo"
+          >
+            <progress
+              value={elapsedSeconds % Math.max(1, activeVodItem.durationSeconds)}
+              max={activeVodItem.durationSeconds}
+              className="block w-full h-full appearance-none [&::-webkit-progress-bar]:bg-transparent [&::-webkit-progress-value]:bg-rose-500 [&::-moz-progress-bar]:bg-rose-500"
+            />
+          </div>
+        )}
+
         <div className="flex flex-wrap items-center justify-between gap-3">
           {/* Audio + Timecode */}
           <div className="flex items-center gap-3">
@@ -265,6 +286,20 @@ export function DiscordTvFullScreen({
                 >
                   <SkipBack className="w-3.5 h-3.5 shrink-0" />
                   <span className="hidden sm:inline">Précédent</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (activeVodItem) {
+                      const pos = elapsedSeconds % Math.max(1, activeVodItem.durationSeconds);
+                      onSeekSeconds(pos + 300);
+                    }
+                  }}
+                  title="Avancer de 5 minutes"
+                  className="inline-flex items-center px-2.5 py-1.5 text-xs font-mono font-medium text-slate-200 bg-slate-900/85 hover:bg-slate-800 border border-slate-700/80 rounded-lg transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  +5m
                 </button>
                 <button
                   type="button"

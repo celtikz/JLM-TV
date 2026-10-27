@@ -308,6 +308,7 @@ export default function App() {
         onSetMode={handleSetMode}
         onPrev={() => sendWsAction('playlist:prev', { requireHls: true })}
         onNext={() => sendWsAction('playlist:next', { requireHls: true })}
+        onSeekSeconds={(seconds) => sendWsAction('video:seek', { seconds })}
         onSelectVideo={(videoId) => sendWsAction('playlist:select', { videoId })}
         onVideoEnded={handleVideoEnded}
         onVideoError={handleVideoError}
@@ -488,6 +489,7 @@ export default function App() {
                   clockOffsetMs={clockOffsetMs}
                   onPrevVideo={() => sendWsAction('playlist:prev')}
                   onNextVideo={() => sendWsAction('playlist:next')}
+                  onSeekSeconds={(seconds) => sendWsAction('video:seek', { seconds })}
                   onSwitchToYoutube={() => handleSetMode('force_youtube')}
                   onEnterFullScreenTv={() => setTvOnlyMode(true)}
                   onReportDuration={handleReportDuration}

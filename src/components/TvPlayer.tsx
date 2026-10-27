@@ -96,6 +96,7 @@ interface TvPlayerProps {
   clockOffsetMs: number;
   onPrevVideo: () => void;
   onNextVideo: () => void;
+  onSeekSeconds: (seconds: number) => void;
   onSwitchToYoutube: () => void;
   onEnterFullScreenTv: () => void;
   onReportDuration: (videoId: string, durationSeconds: number) => void;
@@ -111,13 +112,14 @@ export function TvPlayer({
   clockOffsetMs,
   onPrevVideo,
   onNextVideo,
+  onSeekSeconds,
   onSwitchToYoutube,
   onEnterFullScreenTv,
   onReportDuration,
   onVideoEnded,
   onVideoError,
 }: TvPlayerProps) {
-  const [isMuted, setIsMuted] = useState<boolean>(true);
+  const [isMuted, setIsMuted] = useState<boolean>(false);
   const [reloadNonce, setReloadNonce] = useState<number>(0);
   const [slateImgError, setSlateImgError] = useState<boolean>(false);
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
@@ -376,6 +378,25 @@ export function TvPlayer({
         )}
       </div>
 
+      {/* Synchronized Interactive Seek Progress Bar */}
+      {activeSource === 'youtube' && currentVideo && currentVideo.durationSeconds > 0 && (
+        <div
+          onClick={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+            onSeekSeconds(Math.round(ratio * currentVideo.durationSeconds));
+          }}
+          className="w-full h-2 hover:h-2.5 transition-all cursor-pointer bg-slate-950 overflow-hidden"
+          title="Cliquer pour avancer ou reculer dans le programme"
+        >
+          <progress
+            value={Math.min(elapsedSeconds, currentVideo.durationSeconds)}
+            max={currentVideo.durationSeconds}
+            className="block w-full h-full appearance-none [&::-webkit-progress-bar]:bg-slate-950 [&::-webkit-progress-value]:bg-rose-600 hover:[&::-webkit-progress-value]:bg-rose-500 [&::-moz-progress-bar]:bg-rose-600"
+          />
+        </div>
+      )}
+
       {/* Broadcast Monitor Control Strip */}
       <div className="px-5 py-4 border-t border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div className="min-w-0 space-y-1">
@@ -458,6 +479,18 @@ export function TvPlayer({
               >
                 <SkipBack className="w-3.5 h-3.5 shrink-0" />
                 <span>Précédent</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (currentVideo) {
+                    onSeekSeconds(elapsedSeconds + 300);
+                  }
+                }}
+                title="Avancer de 5 minutes"
+                className="inline-flex items-center gap-1 px-2.5 py-2 text-xs font-mono font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <span>+5m</span>
               </button>
               <button
                 type="button"

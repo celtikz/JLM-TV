@@ -122,6 +122,14 @@ const vodTokenCache = new Map<
   { value: string; signature: string; expiresAt: number }
 >();
 
+function getProgramEntryOffsetSeconds(video?: YouTubeVideoItem | null): number {
+  if (!video || !video.twitchVodId) return 0;
+  if (video.durationSeconds >= 2400) return 720; // Skip 12m "On arrive..." static pre-roll banner
+  if (video.durationSeconds >= 1200) return 360; // Skip 6m pre-roll
+  if (video.durationSeconds >= 480) return 90; // Skip 1m30s pre-roll
+  return 0;
+}
+
 let state: BroadcastState = {
   mode: 'auto',
   activeSource: 'youtube',
@@ -138,7 +146,8 @@ let state: BroadcastState = {
   },
   playlist: [...FALLBACK_VIDEOS],
   currentIndex: 0,
-  currentVideoStartedAt: Date.now(),
+  currentVideoStartedAt:
+    Date.now() - getProgramEntryOffsetSeconds(FALLBACK_VIDEOS[0]) * 1000,
   serverTime: Date.now(),
   connectedViewers: 0,
   shuffleYoutube: false,
@@ -226,8 +235,9 @@ function advancePlaylist(reason: string, direction: 1 | -1 = 1, requireHls = fal
     state.currentIndex = pool[nextPos].idx;
   }
 
-  state.currentVideoStartedAt = Date.now();
   const current = state.playlist[state.currentIndex];
+  const entryOffsetSec = getProgramEntryOffsetSeconds(current);
+  state.currentVideoStartedAt = Date.now() - entryOffsetSec * 1000;
   if (current) {
     appendTransition(`${reason} : ${current.title}`, 'youtube');
   }
@@ -315,7 +325,9 @@ async function probeTwitchChannel(): Promise<TwitchStatus> {
     const fetchedArchives: YouTubeVideoItem[] = [];
     for (const edge of vodEdges) {
       const node = edge?.node;
-      if (!node?.id || !node?.title || !node?.lengthSeconds) continue;
+      if (!node?.id || !node?.title || !node?.lengthSeconds || node.lengthSeconds < 480) {
+        continue;
+      }
       fetchedArchives.push({
         id: `vod-${node.id}`,
         twitchVodId: node.id,
@@ -327,9 +339,15 @@ async function probeTwitchChannel(): Promise<TwitchStatus> {
         sourceType: 'rss',
       });
     }
+    let archivesChanged = false;
     if (fetchedArchives.length > 0) {
+      const prevKey = cachedArchiveItems.map((item) => item.id).join(',');
+      const nextKey = fetchedArchives.map((item) => item.id).join(',');
+      archivesChanged = prevKey !== nextKey;
       cachedArchiveItems = fetchedArchives;
-      rebuildCombinedPlaylist();
+      if (archivesChanged) {
+        rebuildCombinedPlaylist();
+      }
     }
 
     const prevSource = state.activeSource;
@@ -359,15 +377,16 @@ async function probeTwitchChannel(): Promise<TwitchStatus> {
           'twitch'
         );
       } else {
-        state.currentVideoStartedAt = Date.now();
         const vid = state.playlist[state.currentIndex];
+        state.currentVideoStartedAt =
+          Date.now() - getProgramEntryOffsetSeconds(vid) * 1000;
         appendTransition(
           `Fin du direct Twitch — Relais automatique (${vid ? vid.title : 'Grille JLM'})`,
           'youtube'
         );
       }
       broadcastFullState();
-    } else if (wasLive !== isLive || fetchedArchives.length > 0) {
+    } else if (wasLive !== isLive || archivesChanged) {
       broadcastFullState();
     }
   } catch (err) {
@@ -657,7 +676,7 @@ app.get('/api/hls/segment.ts', async (req, res) => {
   }
 
   const abortController = new AbortController();
-  req.on('close', () => {
+  res.on('close', () => {
     if (!res.writableEnded) {
       abortController.abort();
     }
@@ -787,7 +806,9 @@ wss.on('connection', (socket) => {
                   : 'Forçage manuel sur Grille Vidéos';
 
             if (prevSource !== state.activeSource && state.activeSource === 'youtube') {
-              state.currentVideoStartedAt = Date.now();
+              const vid = state.playlist[state.currentIndex];
+              state.currentVideoStartedAt =
+                Date.now() - getProgramEntryOffsetSeconds(vid) * 1000;
             }
             appendTransition(modeLabel, state.activeSource);
             broadcastFullState();
@@ -814,7 +835,8 @@ wss.on('connection', (socket) => {
           const idx = state.playlist.findIndex((v) => v.id === videoId);
           if (idx >= 0) {
             state.currentIndex = idx;
-            state.currentVideoStartedAt = Date.now();
+            state.currentVideoStartedAt =
+              Date.now() - getProgramEntryOffsetSeconds(state.playlist[idx]) * 1000;
             if (state.mode === 'auto' && state.twitch.isLive) {
               state.mode = 'force_youtube';
               state.activeSource = 'youtube';
@@ -823,6 +845,20 @@ wss.on('connection', (socket) => {
               `Sélection directe : ${state.playlist[idx].title}`,
               state.activeSource
             );
+            broadcastFullState();
+          }
+          break;
+        }
+
+        case 'video:seek': {
+          const targetSeconds = Math.max(0, Math.round(Number(msg.payload?.seconds || 0)));
+          const current = state.playlist[state.currentIndex];
+          if (current && state.activeSource === 'youtube') {
+            const clamped = Math.min(
+              Math.max(0, current.durationSeconds - 10),
+              targetSeconds
+            );
+            state.currentVideoStartedAt = Date.now() - clamped * 1000;
             broadcastFullState();
           }
           break;
@@ -889,7 +925,9 @@ wss.on('connection', (socket) => {
               state.currentIndex = 0;
             }
             if (wasCurrent) {
-              state.currentVideoStartedAt = Date.now();
+              const nextCurrent = state.playlist[state.currentIndex];
+              state.currentVideoStartedAt =
+                Date.now() - getProgramEntryOffsetSeconds(nextCurrent) * 1000;
             }
             broadcastFullState();
           }
@@ -934,7 +972,9 @@ wss.on('connection', (socket) => {
             if (state.currentIndex >= state.playlist.length) {
               state.currentIndex = 0;
             }
-            state.currentVideoStartedAt = Date.now();
+            const nextCurrent = state.playlist[state.currentIndex];
+            state.currentVideoStartedAt =
+              Date.now() - getProgramEntryOffsetSeconds(nextCurrent) * 1000;
             appendTransition(
               `Vidéo indisponible ignorée — Passage automatique au programme suivant`,
               'youtube'
@@ -1034,7 +1074,9 @@ setInterval(() => {
     const current = state.playlist[state.currentIndex];
     if (!current) return;
     const elapsedSec = (Date.now() - state.currentVideoStartedAt) / 1000;
-    if (elapsedSec >= current.durationSeconds + 3) {
+    const outroTrimSec =
+      current.twitchVodId && current.durationSeconds >= 1200 ? 90 : 0;
+    if (elapsedSec >= Math.max(30, current.durationSeconds - outroTrimSec) + 2) {
       advancePlaylist('Rotation H24 automatique', 1);
       broadcastFullState();
     }
