@@ -3,6 +3,8 @@ import http from 'http';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import { Readable } from 'stream';
+import type { ReadableStream as NodeWebReadableStream } from 'stream/web';
 import { WebSocketServer, WebSocket } from 'ws';
 import dotenv from 'dotenv';
 import type {
@@ -58,48 +60,53 @@ function extractYoutubeVideoId(input: string): string | null {
 
 const FALLBACK_VIDEOS: YouTubeVideoItem[] = [
   {
-    id: 'SJ1BhZdb8sI',
-    title: 'Conférence de Jean-Luc Mélenchon sur le moment politique',
-    publishedAt: '2026-10-20T19:17:46Z',
+    id: 'vod-2906055180',
+    twitchVodId: '2906055180',
+    title: 'Conférence de Jean-Luc Mélenchon sur le moment politique !',
+    publishedAt: '2026-10-20T17:28:10Z',
     thumbnailUrl: 'https://i2.ytimg.com/vi/SJ1BhZdb8sI/hqdefault.jpg',
-    views: 673315,
-    durationSeconds: 6250,
+    views: 90035,
+    durationSeconds: 6257,
     sourceType: 'rss',
   },
   {
-    id: 'msIb2rNDSTA',
-    title: "Conférence de Jean-Luc Mélenchon à l'ESSEC",
-    publishedAt: '2026-10-26T09:19:33Z',
+    id: 'vod-2900414335',
+    twitchVodId: '2900414335',
+    title: 'Conférence de presse de Jean-Luc Mélenchon et Éric Coquerel',
+    publishedAt: '2026-10-14T09:29:00Z',
     thumbnailUrl: 'https://i2.ytimg.com/vi/msIb2rNDSTA/hqdefault.jpg',
-    views: 27647,
-    durationSeconds: 5400,
+    views: 40761,
+    durationSeconds: 5253,
     sourceType: 'rss',
   },
   {
-    id: 'loxwn3DECHw',
-    title: 'Avec la jeunesse et contre la vie chère, déferlante populaire à Paris !',
-    publishedAt: '2026-10-24T14:15:12Z',
+    id: 'vod-2897888840',
+    twitchVodId: '2897888840',
+    title: 'Meeting de Jean-Luc Mélenchon à Clermont-Ferrand !',
+    publishedAt: '2026-10-11T13:05:43Z',
     thumbnailUrl: 'https://i2.ytimg.com/vi/loxwn3DECHw/hqdefault.jpg',
-    views: 77875,
-    durationSeconds: 2400,
+    views: 62322,
+    durationSeconds: 6146,
     sourceType: 'rss',
   },
   {
-    id: 'o6fu63AyFjY',
-    title: 'Le pouvoir doit céder ou il ne restera plus que la porte de sortie',
-    publishedAt: '2026-10-24T14:51:15Z',
+    id: 'vod-2892736786',
+    twitchVodId: '2892736786',
+    title: "Conférence de Jean-Luc Mélenchon à l'invitation de HEC Débats !",
+    publishedAt: '2026-10-05T17:58:26Z',
     thumbnailUrl: 'https://i2.ytimg.com/vi/o6fu63AyFjY/hqdefault.jpg',
-    views: 557605,
-    durationSeconds: 900,
+    views: 67246,
+    durationSeconds: 7903,
     sourceType: 'rss',
   },
   {
-    id: '7hBEv95Q8Ew',
-    title: 'La victoire de Lula sera la victoire du peuple',
-    publishedAt: '2026-10-23T16:21:17Z',
+    id: 'vod-2889055110',
+    twitchVodId: '2889055110',
+    title: 'Conférence de Jean-Luc Mélenchon sur le moment politique',
+    publishedAt: '2026-10-01T17:18:39Z',
     thumbnailUrl: 'https://i2.ytimg.com/vi/7hBEv95Q8Ew/hqdefault.jpg',
-    views: 211867,
-    durationSeconds: 900,
+    views: 11148,
+    durationSeconds: 4614,
     sourceType: 'rss',
   },
 ];
@@ -107,6 +114,13 @@ const FALLBACK_VIDEOS: YouTubeVideoItem[] = [
 const durationCache = new Map<string, number>();
 const unplayableVideoIds = new Set<string>();
 const processedMessageIds = new Set<string>();
+let cachedArchiveItems: YouTubeVideoItem[] = [...FALLBACK_VIDEOS];
+let cachedYoutubeRssItems: YouTubeVideoItem[] = [];
+
+const vodTokenCache = new Map<
+  string,
+  { value: string; signature: string; expiresAt: number }
+>();
 
 let state: BroadcastState = {
   mode: 'auto',
@@ -140,7 +154,7 @@ let state: BroadcastState = {
     {
       id: 'welcome-msg',
       author: 'Régie Antenne',
-      text: 'Synchronisation H24 active : bascule automatique sur twitch.tv/jlmelenchon dès qu’un direct démarre, relais YouTube continu hors antenne.',
+      text: 'Synchronisation H24 active : bascule automatique sur twitch.tv/jlmelenchon dès qu’un direct démarre, relais vidéo continu hors antenne.',
       createdAt: new Date().toISOString(),
     },
   ],
@@ -162,18 +176,54 @@ function computeDesiredSource(mode: BroadcastMode, isTwitchLive: boolean): Activ
   return isTwitchLive ? 'twitch' : 'youtube';
 }
 
-function advancePlaylist(reason: string, direction: 1 | -1 = 1) {
+function rebuildCombinedPlaylist() {
+  const currentPlayingId = state.playlist[state.currentIndex]?.id;
+  const customVideos = state.playlist.filter(
+    (v) => v.sourceType === 'custom' && !unplayableVideoIds.has(v.id)
+  );
+  const existingIds = new Set<string>();
+  const combined: YouTubeVideoItem[] = [];
+
+  for (const item of [...customVideos, ...cachedArchiveItems, ...cachedYoutubeRssItems]) {
+    if (unplayableVideoIds.has(item.id) || existingIds.has(item.id)) continue;
+    existingIds.add(item.id);
+    combined.push(item);
+  }
+
+  if (combined.length > 0) {
+    state.playlist = combined;
+    if (currentPlayingId) {
+      const idx = state.playlist.findIndex((v) => v.id === currentPlayingId);
+      state.currentIndex = idx >= 0 ? idx : 0;
+    } else {
+      state.currentIndex = 0;
+    }
+  }
+}
+
+function advancePlaylist(reason: string, direction: 1 | -1 = 1, requireHls = false) {
   if (state.playlist.length === 0) return;
 
-  if (state.shuffleYoutube && state.playlist.length > 1 && direction === 1) {
-    let nextIdx = state.currentIndex;
-    while (nextIdx === state.currentIndex) {
-      nextIdx = Math.floor(Math.random() * state.playlist.length);
-    }
-    state.currentIndex = nextIdx;
+  const candidateIndices = state.playlist
+    .map((item, idx) => ({ item, idx }))
+    .filter(({ item }) => !requireHls || Boolean(item.twitchVodId));
+
+  const pool =
+    candidateIndices.length > 0
+      ? candidateIndices
+      : state.playlist.map((item, idx) => ({ item, idx }));
+
+  if (state.shuffleYoutube && pool.length > 1 && direction === 1) {
+    const others = pool.filter((p) => p.idx !== state.currentIndex);
+    const chosen = others[Math.floor(Math.random() * others.length)] || pool[0];
+    state.currentIndex = chosen.idx;
   } else {
-    state.currentIndex =
-      (state.currentIndex + direction + state.playlist.length) % state.playlist.length;
+    const currentPosInPool = pool.findIndex((p) => p.idx === state.currentIndex);
+    const nextPos =
+      currentPosInPool >= 0
+        ? (currentPosInPool + direction + pool.length) % pool.length
+        : 0;
+    state.currentIndex = pool[nextPos].idx;
   }
 
   state.currentVideoStartedAt = Date.now();
@@ -206,6 +256,18 @@ async function probeTwitchChannel(): Promise<TwitchStatus> {
               viewersCount
               createdAt
             }
+            videos(first: 18, type: ARCHIVE) {
+              edges {
+                node {
+                  id
+                  title
+                  lengthSeconds
+                  publishedAt
+                  viewCount
+                  previewThumbnailURL(width: 640, height: 360)
+                }
+              }
+            }
           }
         }`,
       }),
@@ -229,6 +291,18 @@ async function probeTwitchChannel(): Promise<TwitchStatus> {
             viewersCount?: number;
             createdAt?: string;
           } | null;
+          videos?: {
+            edges?: Array<{
+              node?: {
+                id?: string;
+                title?: string;
+                lengthSeconds?: number;
+                publishedAt?: string;
+                viewCount?: number;
+                previewThumbnailURL?: string;
+              };
+            }>;
+          };
         };
       };
     };
@@ -236,6 +310,27 @@ async function probeTwitchChannel(): Promise<TwitchStatus> {
     const user = payload?.data?.user;
     const stream = user?.stream ?? null;
     const isLive = Boolean(stream && stream.type === 'live');
+
+    const vodEdges = user?.videos?.edges || [];
+    const fetchedArchives: YouTubeVideoItem[] = [];
+    for (const edge of vodEdges) {
+      const node = edge?.node;
+      if (!node?.id || !node?.title || !node?.lengthSeconds) continue;
+      fetchedArchives.push({
+        id: `vod-${node.id}`,
+        twitchVodId: node.id,
+        title: node.title,
+        publishedAt: node.publishedAt || new Date().toISOString(),
+        thumbnailUrl: node.previewThumbnailURL || '',
+        views: node.viewCount ?? 0,
+        durationSeconds: node.lengthSeconds,
+        sourceType: 'rss',
+      });
+    }
+    if (fetchedArchives.length > 0) {
+      cachedArchiveItems = fetchedArchives;
+      rebuildCombinedPlaylist();
+    }
 
     const prevSource = state.activeSource;
     const wasLive = state.twitch.isLive;
@@ -267,12 +362,12 @@ async function probeTwitchChannel(): Promise<TwitchStatus> {
         state.currentVideoStartedAt = Date.now();
         const vid = state.playlist[state.currentIndex];
         appendTransition(
-          `Fin du direct Twitch — Relais YouTube automatique (${vid ? vid.title : 'Grille JLM'})`,
+          `Fin du direct Twitch — Relais automatique (${vid ? vid.title : 'Grille JLM'})`,
           'youtube'
         );
       }
       broadcastFullState();
-    } else if (wasLive !== isLive) {
+    } else if (wasLive !== isLive || fetchedArchives.length > 0) {
       broadcastFullState();
     }
   } catch (err) {
@@ -310,12 +405,11 @@ async function syncYoutubeFeed(): Promise<void> {
       if (unplayableVideoIds.has(id)) continue;
 
       const views = viewsMatch ? Number(viewsMatch[1]) : 0;
-      // Skip scheduled upcoming premieres that have 0 views and are not yet playable
       if (views === 0) continue;
 
       const title = decodeXmlEntities(titleMatch[1].trim());
       const publishedAt = pubMatch ? pubMatch[1].trim() : new Date().toISOString();
-      const cachedDuration = durationCache.get(id) ?? 1800;
+      const cachedDuration = durationCache.get(id) ?? 1200;
 
       parsedItems.push({
         id,
@@ -329,22 +423,8 @@ async function syncYoutubeFeed(): Promise<void> {
     }
 
     if (parsedItems.length > 0) {
-      const currentPlayingId = state.playlist[state.currentIndex]?.id;
-      const customVideos = state.playlist.filter(
-        (v) => v.sourceType === 'custom' && !unplayableVideoIds.has(v.id)
-      );
-      const rssIds = new Set(parsedItems.map((i) => i.id));
-      const uniqueCustom = customVideos.filter((c) => !rssIds.has(c.id));
-
-      state.playlist = [...uniqueCustom, ...parsedItems];
-
-      if (currentPlayingId) {
-        const preservedIdx = state.playlist.findIndex((v) => v.id === currentPlayingId);
-        state.currentIndex = preservedIdx >= 0 ? preservedIdx : 0;
-      } else {
-        state.currentIndex = 0;
-      }
-
+      cachedYoutubeRssItems = parsedItems;
+      rebuildCombinedPlaylist();
       broadcastFullState();
     }
   } catch (err) {
@@ -366,6 +446,115 @@ async function fetchYoutubeOEmbedTitle(videoId: string): Promise<string> {
   }
 }
 
+// ============================================================================
+// HLS Stream Proxy for CSP-Compliant Native <video> Playback in Discord Activity
+// ============================================================================
+
+function isAllowedHlsHost(rawUrl: string): boolean {
+  try {
+    const u = new URL(rawUrl);
+    if (u.protocol !== 'https:') return false;
+    const h = u.hostname.toLowerCase();
+    return (
+      h === 'usher.ttvnw.net' ||
+      h.endsWith('.ttvnw.net') ||
+      h.endsWith('.twitch.tv') ||
+      h.endsWith('.twitchcdn.net') ||
+      h.endsWith('.cloudfront.net') ||
+      h.endsWith('.akamaized.net')
+    );
+  } catch {
+    return false;
+  }
+}
+
+function rewriteM3u8Manifest(m3u8Text: string, baseUrl: string): string {
+  const lines = m3u8Text.split(/\r?\n/);
+  return lines
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+
+      if (trimmed.startsWith('#')) {
+        return line.replace(/URI="([^"]+)"/g, (_match, uriVal: string) => {
+          try {
+            const abs = new URL(uriVal, baseUrl).href;
+            const cleanPath = abs.split('?')[0].toLowerCase();
+            const route = cleanPath.endsWith('.m3u8') ? 'playlist.m3u8' : 'segment.ts';
+            return `URI="${route}?u=${encodeURIComponent(abs)}"`;
+          } catch {
+            return _match;
+          }
+        });
+      }
+
+      try {
+        const abs = new URL(trimmed, baseUrl).href;
+        const cleanPath = abs.split('?')[0].toLowerCase();
+        const route = cleanPath.endsWith('.m3u8') ? 'playlist.m3u8' : 'segment.ts';
+        return `${route}?u=${encodeURIComponent(abs)}`;
+      } catch {
+        return line;
+      }
+    })
+    .join('\n');
+}
+
+async function fetchTwitchPlaybackToken(
+  opts: { isLive: true; login: string } | { isLive: false; vodId: string }
+): Promise<{ value: string; signature: string } | null> {
+  if (!opts.isLive) {
+    const cached = vodTokenCache.get(opts.vodId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return { value: cached.value, signature: cached.signature };
+    }
+  }
+
+  const gqlRes = await fetch('https://gql.twitch.tv/gql', {
+    method: 'POST',
+    headers: {
+      'Client-Id': TWITCH_PUBLIC_CLIENT_ID,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      operationName: 'PlaybackAccessToken_Template',
+      query:
+        'query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isLive) { value signature } videoPlaybackAccessToken(id: $vodID, params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isVod) { value signature } }',
+      variables: {
+        isLive: opts.isLive,
+        login: opts.isLive ? opts.login : '',
+        isVod: !opts.isLive,
+        vodID: !opts.isLive ? opts.vodId : '',
+        playerType: 'embed',
+      },
+    }),
+  });
+
+  if (!gqlRes.ok) return null;
+  const json = (await gqlRes.json()) as {
+    data?: {
+      streamPlaybackAccessToken?: { value?: string; signature?: string } | null;
+      videoPlaybackAccessToken?: { value?: string; signature?: string } | null;
+    };
+  };
+
+  const tok = opts.isLive
+    ? json?.data?.streamPlaybackAccessToken
+    : json?.data?.videoPlaybackAccessToken;
+
+  if (!tok?.value || !tok?.signature) return null;
+
+  if (!opts.isLive) {
+    vodTokenCache.set(opts.vodId, {
+      value: tok.value,
+      signature: tok.signature,
+      expiresAt: Date.now() + 10 * 60_000,
+    });
+  }
+
+  return { value: tok.value, signature: tok.signature };
+}
+
 const app = express();
 app.use((req, _res, next) => {
   if (req.url.startsWith('/.proxy/')) {
@@ -376,6 +565,146 @@ app.use((req, _res, next) => {
   next();
 });
 app.use(express.json());
+
+// HLS Live Stream Endpoint
+app.get('/api/hls/live.m3u8', async (_req, res) => {
+  try {
+    const tok = await fetchTwitchPlaybackToken({ isLive: true, login: TWITCH_LOGIN });
+    if (!tok) {
+      res.status(404).send('Channel offline or token unavailable');
+      return;
+    }
+    const usherUrl = `https://usher.ttvnw.net/api/channel/hls/${TWITCH_LOGIN}.m3u8?sig=${encodeURIComponent(
+      tok.signature
+    )}&token=${encodeURIComponent(tok.value)}&allow_source=true&allow_audio_only=true&fast_bread=true`;
+
+    const upstream = await fetch(usherUrl);
+    if (!upstream.ok) {
+      res.status(upstream.status).send('Live stream currently offline');
+      return;
+    }
+    const text = await upstream.text();
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(rewriteM3u8Manifest(text, usherUrl));
+  } catch (err) {
+    console.error('[HLS Live Error]:', err);
+    res.status(502).send('HLS live proxy error');
+  }
+});
+
+// HLS Archive VOD Endpoint
+app.get('/api/hls/vod-:vodId.m3u8', async (req, res) => {
+  try {
+    const vodId = String(req.params.vodId || '').replace(/[^0-9]/g, '');
+    if (!vodId) {
+      res.status(400).send('Invalid VOD ID');
+      return;
+    }
+    const tok = await fetchTwitchPlaybackToken({ isLive: false, vodId });
+    if (!tok) {
+      res.status(404).send('VOD token unavailable');
+      return;
+    }
+    const usherUrl = `https://usher.ttvnw.net/vod/${vodId}.m3u8?sig=${encodeURIComponent(
+      tok.signature
+    )}&token=${encodeURIComponent(tok.value)}&allow_source=true`;
+
+    const upstream = await fetch(usherUrl);
+    if (!upstream.ok) {
+      res.status(upstream.status).send('VOD manifest unavailable');
+      return;
+    }
+    const text = await upstream.text();
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(rewriteM3u8Manifest(text, usherUrl));
+  } catch (err) {
+    console.error('[HLS VOD Error]:', err);
+    res.status(502).send('HLS VOD proxy error');
+  }
+});
+
+// HLS Variant Playlist Proxy
+app.get('/api/hls/playlist.m3u8', async (req, res) => {
+  try {
+    const targetUrl = String(req.query.u || '');
+    if (!isAllowedHlsHost(targetUrl)) {
+      res.status(403).send('Forbidden upstream host');
+      return;
+    }
+    const upstream = await fetch(targetUrl);
+    if (!upstream.ok) {
+      res.status(upstream.status).send('Variant playlist fetch failed');
+      return;
+    }
+    const text = await upstream.text();
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(rewriteM3u8Manifest(text, targetUrl));
+  } catch (err) {
+    console.error('[HLS Variant Error]:', err);
+    res.status(502).send('Variant proxy error');
+  }
+});
+
+// HLS Binary Media Segment Streaming Pipe (.ts / .aac / .mp4)
+app.get('/api/hls/segment.ts', async (req, res) => {
+  const targetUrl = String(req.query.u || '');
+  if (!isAllowedHlsHost(targetUrl)) {
+    res.status(403).send('Forbidden segment host');
+    return;
+  }
+
+  const abortController = new AbortController();
+  req.on('close', () => {
+    if (!res.writableEnded) {
+      abortController.abort();
+    }
+  });
+
+  try {
+    const headers: Record<string, string> = {};
+    if (req.headers.range) {
+      headers['Range'] = req.headers.range;
+    }
+
+    const upstream = await fetch(targetUrl, {
+      headers,
+      signal: abortController.signal,
+    });
+
+    res.status(upstream.status);
+    res.setHeader(
+      'Content-Type',
+      upstream.headers.get('content-type') || 'video/mp2t'
+    );
+    const contentLength = upstream.headers.get('content-length');
+    if (contentLength) {
+      res.setHeader('Content-Length', contentLength);
+    }
+    res.setHeader('Cache-Control', 'public, max-age=300');
+
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+
+    const nodeStream = Readable.fromWeb(
+      upstream.body as unknown as NodeWebReadableStream
+    );
+    nodeStream.on('error', () => {
+      if (!res.writableEnded) res.end();
+    });
+    nodeStream.pipe(res);
+  } catch {
+    if (!res.headersSent) {
+      res.status(502).end();
+    } else if (!res.writableEnded) {
+      res.end();
+    }
+  }
+});
 
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
@@ -455,7 +784,7 @@ wss.on('connection', (socket) => {
                 ? 'Mode Automatique (Priorité Direct Twitch)'
                 : nextMode === 'force_twitch'
                   ? 'Forçage manuel sur Twitch Direct'
-                  : 'Forçage manuel sur Grille YouTube';
+                  : 'Forçage manuel sur Grille Vidéos';
 
             if (prevSource !== state.activeSource && state.activeSource === 'youtube') {
               state.currentVideoStartedAt = Date.now();
@@ -467,13 +796,15 @@ wss.on('connection', (socket) => {
         }
 
         case 'playlist:next': {
-          advancePlaylist('Passage manuel au programme suivant', 1);
+          const requireHls = Boolean(msg.payload?.requireHls);
+          advancePlaylist('Passage manuel au programme suivant', 1, requireHls);
           broadcastFullState();
           break;
         }
 
         case 'playlist:prev': {
-          advancePlaylist('Retour au programme précédent', -1);
+          const requireHls = Boolean(msg.payload?.requireHls);
+          advancePlaylist('Retour au programme précédent', -1, requireHls);
           broadcastFullState();
           break;
         }
@@ -582,14 +913,13 @@ wss.on('connection', (socket) => {
         case 'video:ended': {
           const videoId = String(msg.payload?.videoId || '');
           const current = state.playlist[state.currentIndex];
-          // Idempotent check: ignore duplicate ended signals if server already switched
           if (
             state.activeSource === 'youtube' &&
             current &&
             current.id === videoId &&
             Date.now() - state.currentVideoStartedAt > 5000
           ) {
-            advancePlaylist('Fin du programme — Enchaînement grille YouTube', 1);
+            advancePlaylist('Fin du programme — Enchaînement grille H24', 1);
             broadcastFullState();
           }
           break;
@@ -606,7 +936,7 @@ wss.on('connection', (socket) => {
             }
             state.currentVideoStartedAt = Date.now();
             appendTransition(
-              `Vidéo non intégrable ignorée — Passage automatique au programme suivant`,
+              `Vidéo indisponible ignorée — Passage automatique au programme suivant`,
               'youtube'
             );
             broadcastFullState();
@@ -658,7 +988,6 @@ wss.on('connection', (socket) => {
   });
 });
 
-// REST API routes for initial state, forced probing, and external Discord Voice Bot synchronization
 app.get('/api/tv/state', (_req, res) => {
   res.json(getPublicState());
 });
@@ -681,14 +1010,17 @@ app.get('/api/tv/bot-directive', (_req, res) => {
     twitchLive: state.twitch.isLive,
     twitchTitle: state.twitch.title,
     youtubeVideoId: currentVideo?.id || null,
-    youtubeUrl: currentVideo ? `https://www.youtube.com/watch?v=${currentVideo.id}` : null,
+    youtubeUrl: currentVideo
+      ? currentVideo.twitchVodId
+        ? `https://www.twitch.tv/videos/${currentVideo.twitchVodId}`
+        : `https://www.youtube.com/watch?v=${currentVideo.id}`
+      : null,
     youtubeTitle: currentVideo?.title || null,
     seekSeconds: state.activeSource === 'youtube' ? elapsedSeconds : 0,
     serverTime: Date.now(),
   });
 });
 
-// Background 24/7 broadcast automation loops
 setInterval(() => {
   void probeTwitchChannel();
 }, 30_000);

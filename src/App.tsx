@@ -18,6 +18,7 @@ import type {
   ChatMessage,
 } from './types/broadcast';
 import { TvPlayer } from './components/TvPlayer';
+import { DiscordTvFullScreen } from './components/DiscordTvFullScreen';
 import { BotBuilderView } from './components/BotBuilderView';
 import { DeploymentGuideView } from './components/DeploymentGuideView';
 import { generateDiscordBotFiles } from './utils/botGenerator';
@@ -57,6 +58,11 @@ export default function App() {
   const discordActivity = useDiscordActivity();
 
   const [activeTab, setActiveTab] = useState<NavTab>('regie');
+  const [tvOnlyMode, setTvOnlyMode] = useState<boolean>(() => {
+    if (isRunningInDiscordProxy()) return true;
+    const params = new URLSearchParams(window.location.search);
+    return params.get('tv') === '1' || params.has('frame_id');
+  });
   const [broadcast, setBroadcast] = useState<BroadcastState | null>(null);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [clockOffsetMs, setClockOffsetMs] = useState<number>(0);
@@ -285,6 +291,30 @@ export default function App() {
     });
   }, [broadcast, searchQuery, sourceFilter]);
 
+  if (tvOnlyMode) {
+    if (!broadcast) {
+      return (
+        <div className="fixed inset-0 w-screen h-screen bg-black flex items-center justify-center text-xs text-slate-400">
+          Connexion au signal JLM Télévision H24...
+        </div>
+      );
+    }
+    return (
+      <DiscordTvFullScreen
+        broadcast={broadcast}
+        clockOffsetMs={clockOffsetMs}
+        canExitFullScreen={!isRunningInDiscordProxy()}
+        onExitFullScreen={() => setTvOnlyMode(false)}
+        onSetMode={handleSetMode}
+        onPrev={() => sendWsAction('playlist:prev', { requireHls: true })}
+        onNext={() => sendWsAction('playlist:next', { requireHls: true })}
+        onSelectVideo={(videoId) => sendWsAction('playlist:select', { videoId })}
+        onVideoEnded={handleVideoEnded}
+        onVideoError={handleVideoError}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen flex flex-col bg-[#0B0F19] text-slate-100">
       {/* Strict 3-Zone Top Bar Contract */}
@@ -459,6 +489,7 @@ export default function App() {
                   onPrevVideo={() => sendWsAction('playlist:prev')}
                   onNextVideo={() => sendWsAction('playlist:next')}
                   onSwitchToYoutube={() => handleSetMode('force_youtube')}
+                  onEnterFullScreenTv={() => setTvOnlyMode(true)}
                   onReportDuration={handleReportDuration}
                   onVideoEnded={handleVideoEnded}
                   onVideoError={handleVideoError}

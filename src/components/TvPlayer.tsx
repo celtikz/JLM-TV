@@ -8,9 +8,11 @@ import {
   Tv,
   Radio,
   ExternalLink,
+  Maximize2,
 } from 'lucide-react';
 import type { ActiveSource, TwitchStatus, YouTubeVideoItem } from '../types/broadcast';
 import { isRunningInDiscordProxy } from '../hooks/useDiscordActivity';
+import { HlsVideoStream } from './HlsVideoStream';
 
 const STUDIO_SLATE_IMG = '/src/assets/images/tv_broadcast_slate_1793131336238.jpg';
 
@@ -95,6 +97,7 @@ interface TvPlayerProps {
   onPrevVideo: () => void;
   onNextVideo: () => void;
   onSwitchToYoutube: () => void;
+  onEnterFullScreenTv: () => void;
   onReportDuration: (videoId: string, durationSeconds: number) => void;
   onVideoEnded: (videoId: string) => void;
   onVideoError: (videoId: string) => void;
@@ -109,13 +112,13 @@ export function TvPlayer({
   onPrevVideo,
   onNextVideo,
   onSwitchToYoutube,
+  onEnterFullScreenTv,
   onReportDuration,
   onVideoEnded,
   onVideoError,
 }: TvPlayerProps) {
   const [isMuted, setIsMuted] = useState<boolean>(true);
   const [reloadNonce, setReloadNonce] = useState<number>(0);
-  const [showRawTwitchWhenOffline, setShowRawTwitchWhenOffline] = useState<boolean>(false);
   const [slateImgError, setSlateImgError] = useState<boolean>(false);
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
 
@@ -130,6 +133,9 @@ export function TvPlayer({
   clockOffsetRef.current = clockOffsetMs;
   isMutedRef.current = isMuted;
 
+  const apiBase = isRunningInDiscordProxy() ? '/.proxy' : '';
+  const useHlsForYoutubeItem = Boolean(currentVideo?.twitchVodId);
+
   useEffect(() => {
     const updateClock = () => {
       const serverNow = Date.now() + clockOffsetRef.current;
@@ -141,47 +147,13 @@ export function TvPlayer({
     return () => window.clearInterval(timer);
   }, [currentVideoStartedAt, clockOffsetMs]);
 
-  const twitchEmbedUrl = useMemo(() => {
-    const parents = new Set<string>();
-    if (window.location.hostname) {
-      parents.add(window.location.hostname);
-    }
-    const ancestorList = window.location.ancestorOrigins;
-    if (ancestorList) {
-      for (let i = 0; i < ancestorList.length; i++) {
-        try {
-          const host = new URL(ancestorList[i]).hostname;
-          if (host) parents.add(host);
-        } catch {
-          // Ignore malformed origin
-        }
-      }
-    }
-    if (document.referrer) {
-      try {
-        const refHost = new URL(document.referrer).hostname;
-        if (refHost) parents.add(refHost);
-      } catch {
-        // Ignore malformed referrer
-      }
-    }
-    parents.add('aistudio.google.com');
-    parents.add('discord.com');
-
-    const parentQuery = Array.from(parents)
-      .map((p) => `parent=${encodeURIComponent(p)}`)
-      .join('&');
-
-    const baseHost = isRunningInDiscordProxy() ? '/twitch-player/' : 'https://player.twitch.tv/';
-    return `${baseHost}?channel=${encodeURIComponent(
-      twitch.channelLogin
-    )}&autoplay=true&muted=${isMuted ? 'true' : 'false'}&${parentQuery}&_r=${reloadNonce}`;
-  }, [twitch.channelLogin, isMuted, reloadNonce]);
-
-  const inDiscordProxy = isRunningInDiscordProxy();
-
   useEffect(() => {
-    if (inDiscordProxy || activeSource !== 'youtube' || !currentVideo) {
+    if (
+      isRunningInDiscordProxy() ||
+      activeSource !== 'youtube' ||
+      !currentVideo ||
+      useHlsForYoutubeItem
+    ) {
       if (ytPlayerRef.current) {
         ytPlayerRef.current.destroy();
         ytPlayerRef.current = null;
@@ -274,6 +246,7 @@ export function TvPlayer({
   }, [
     activeSource,
     currentVideo?.id,
+    useHlsForYoutubeItem,
     currentVideoStartedAt,
     reloadNonce,
     onReportDuration,
@@ -293,7 +266,7 @@ export function TvPlayer({
   const handleToggleMute = () => {
     const nextMuted = !isMuted;
     setIsMuted(nextMuted);
-    if (activeSource === 'youtube' && ytPlayerRef.current) {
+    if (activeSource === 'youtube' && !useHlsForYoutubeItem && ytPlayerRef.current) {
       if (nextMuted) {
         ytPlayerRef.current.mute();
       } else {
@@ -304,7 +277,7 @@ export function TvPlayer({
   };
 
   const handleResync = () => {
-    if (activeSource === 'youtube' && ytPlayerRef.current) {
+    if (activeSource === 'youtube' && !useHlsForYoutubeItem && ytPlayerRef.current) {
       const serverNow = Date.now() + clockOffsetMs;
       const startSec = Math.max(0, Math.floor((serverNow - currentVideoStartedAt) / 1000));
       ytPlayerRef.current.seekTo(startSec, true);
@@ -314,8 +287,20 @@ export function TvPlayer({
     }
   };
 
-  const showOfflineSlate =
-    activeSource === 'twitch' && !twitch.isLive && !showRawTwitchWhenOffline;
+  const targetVodStartSec = useMemo(() => {
+    if (!currentVideo) return 0;
+    const serverNow = Date.now() + clockOffsetMs;
+    const raw = Math.max(0, Math.floor((serverNow - currentVideoStartedAt) / 1000));
+    return currentVideo.durationSeconds > 0 ? raw % currentVideo.durationSeconds : raw;
+  }, [
+    currentVideo?.id,
+    currentVideo?.durationSeconds,
+    currentVideoStartedAt,
+    clockOffsetMs,
+    reloadNonce,
+  ]);
+
+  const showOfflineSlate = activeSource === 'twitch' && !twitch.isLive;
 
   return (
     <div className="border border-slate-800 bg-slate-900/60 rounded-xl overflow-hidden">
@@ -347,7 +332,7 @@ export function TvPlayer({
                 </h2>
                 <p className="text-sm text-slate-300 leading-relaxed">
                   Le forçage manuel sur Twitch est actif. Passez en mode Automatique ou sur la
-                  Grille YouTube pour diffuser les conférences et interventions en continu.
+                  Grille Vidéos pour diffuser les conférences et meetings en continu.
                 </p>
                 <div className="flex flex-wrap items-center gap-3 pt-1">
                   <button
@@ -355,41 +340,33 @@ export function TvPlayer({
                     onClick={onSwitchToYoutube}
                     className="px-4 py-2 text-xs font-medium text-white bg-rose-600 hover:bg-rose-500 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    Basculer sur le relais YouTube
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setShowRawTwitchWhenOffline(true)}
-                    className="px-4 py-2 text-xs font-medium text-slate-200 bg-slate-800/90 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                  >
-                    Afficher le lecteur Twitch
+                    Basculer sur le relais vidéos H24
                   </button>
                 </div>
               </div>
             </div>
           ) : (
-            <iframe
-              key={twitchEmbedUrl}
-              src={twitchEmbedUrl}
-              title={`Direct Twitch ${twitch.displayName}`}
-              className="w-full h-full border-0"
-              allow="autoplay; fullscreen"
-              allowFullScreen
+            <HlsVideoStream
+              manifestUrl={`${apiBase}/api/hls/live.m3u8`}
+              isLive={true}
+              targetStartSeconds={0}
+              isMuted={isMuted}
+              volume={1}
+              reloadKey={reloadNonce}
+              onMutedChange={setIsMuted}
             />
           )
-        ) : inDiscordProxy && currentVideo ? (
-          <iframe
-            key={`${currentVideo.id}-${isMuted}-${reloadNonce}`}
-            src={`/youtube-embed/embed/${encodeURIComponent(currentVideo.id)}?autoplay=1&mute=${
-              isMuted ? 1 : 0
-            }&start=${Math.max(
-              0,
-              Math.floor((Date.now() + clockOffsetMs - currentVideoStartedAt) / 1000)
-            )}&playsinline=1&rel=0`}
-            title={currentVideo.title}
-            className="w-full h-full border-0"
-            allow="autoplay; fullscreen"
-            allowFullScreen
+        ) : useHlsForYoutubeItem && currentVideo?.twitchVodId ? (
+          <HlsVideoStream
+            manifestUrl={`${apiBase}/api/hls/vod-${currentVideo.twitchVodId}.m3u8`}
+            isLive={false}
+            targetStartSeconds={targetVodStartSec}
+            isMuted={isMuted}
+            volume={1}
+            reloadKey={reloadNonce}
+            onMutedChange={setIsMuted}
+            onEnded={() => onVideoEnded(currentVideo.id)}
+            onStreamError={() => onVideoError(currentVideo.id)}
           />
         ) : (
           <div
@@ -424,7 +401,7 @@ export function TvPlayer({
               <>
                 <span className="inline-flex items-center gap-1.5 font-medium text-amber-400">
                   <Tv className="w-3.5 h-3.5 shrink-0" />
-                  Relais TV YouTube H24
+                  Relais TV H24
                 </span>
                 <span aria-hidden="true">·</span>
                 <span>JEAN-LUC MÉLENCHON</span>
@@ -444,7 +421,7 @@ export function TvPlayer({
           <h2 className="text-base sm:text-lg font-semibold text-slate-100 truncate">
             {activeSource === 'twitch'
               ? twitch.title
-              : currentVideo?.title || 'Chargement de la programmation YouTube...'}
+              : currentVideo?.title || 'Chargement de la programmation...'}
           </h2>
         </div>
 
@@ -504,11 +481,23 @@ export function TvPlayer({
             <span>Resynchroniser</span>
           </button>
 
+          <button
+            type="button"
+            onClick={onEnterFullScreenTv}
+            title="Afficher uniquement l’écran TV (comme dans Discord)"
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Maximize2 className="w-3.5 h-3.5 shrink-0" />
+            <span>Mode TV seul</span>
+          </button>
+
           <a
             href={
               activeSource === 'twitch'
                 ? `https://www.twitch.tv/${twitch.channelLogin}`
-                : `https://www.youtube.com/watch?v=${currentVideo?.id || ''}`
+                : currentVideo?.twitchVodId
+                  ? `https://www.twitch.tv/videos/${currentVideo.twitchVodId}`
+                  : `https://www.youtube.com/watch?v=${currentVideo?.id || ''}`
             }
             target="_blank"
             rel="noopener noreferrer"

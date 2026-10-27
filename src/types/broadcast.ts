@@ -21,6 +21,7 @@ export interface YouTubeVideoItem {
   views: number;
   durationSeconds: number;
   sourceType: 'rss' | 'custom';
+  twitchVodId?: string;
 }
 
 export interface TransitionLog {
