@@ -343,11 +343,13 @@ export default function App() {
         canExitFullScreen={!isRunningInDiscordProxy()}
         onExitFullScreen={() => setTvOnlyMode(false)}
         onSetMode={handleSetMode}
-        onPrev={() => sendWsAction('playlist:prev', { requireHls: true })}
-        onNext={() => sendWsAction('playlist:next', { requireHls: true })}
+        onPrev={() => sendWsAction('playlist:prev', { requireHls: false })}
+        onNext={() => sendWsAction('playlist:next', { requireHls: false })}
         onSeekSeconds={(seconds) => sendWsAction('video:seek', { seconds })}
         onSelectVideo={(videoId) => sendWsAction('playlist:select', { videoId })}
-        onAddMediaNow={(url) => submitMediaUrl(url, true)}
+        onAddMedia={(url, playNow) => submitMediaUrl(url, playNow)}
+        onRemoveVideo={(videoId) => sendWsAction('playlist:remove', { videoId })}
+        onReportDuration={handleReportDuration}
         onVideoEnded={handleVideoEnded}
         onVideoError={handleVideoError}
       />

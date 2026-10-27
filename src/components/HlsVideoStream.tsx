@@ -10,6 +10,7 @@ interface HlsVideoStreamProps {
   volume: number;
   reloadKey?: number;
   onMutedChange: (muted: boolean) => void;
+  onDurationDetected?: (durationSeconds: number) => void;
   onEnded?: () => void;
   onStreamError?: () => void;
 }
@@ -22,17 +23,19 @@ export function HlsVideoStream({
   volume,
   reloadKey = 0,
   onMutedChange,
+  onDurationDetected,
   onEnded,
   onStreamError,
 }: HlsVideoStreamProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
 
-  // Store dynamic props and callbacks in refs so the HLS instance is NEVER recreated on parent re-renders
+  // Store dynamic props and callbacks in refs so the player instance is NEVER recreated on parent re-renders
   const initialStartRef = useRef<number>(targetStartSeconds);
   const isMutedRef = useRef<boolean>(isMuted);
   const volumeRef = useRef<number>(volume);
   const onMutedChangeRef = useRef(onMutedChange);
+  const onDurationDetectedRef = useRef(onDurationDetected);
   const onEndedRef = useRef(onEnded);
   const onStreamErrorRef = useRef(onStreamError);
 
@@ -40,6 +43,7 @@ export function HlsVideoStream({
   isMutedRef.current = isMuted;
   volumeRef.current = volume;
   onMutedChangeRef.current = onMutedChange;
+  onDurationDetectedRef.current = onDurationDetected;
   onEndedRef.current = onEnded;
   onStreamErrorRef.current = onStreamError;
 
@@ -55,6 +59,8 @@ export function HlsVideoStream({
     setIsPaused(false);
     let destroyed = false;
     let autoplayAttempted = false;
+
+    const isDirectMp4 = manifestUrl.includes('/api/yt/stream/');
 
     const startPlaybackWhenReady = async () => {
       if (destroyed || autoplayAttempted || !videoRef.current) return;
@@ -95,6 +101,55 @@ export function HlsVideoStream({
     };
 
     video.addEventListener('canplay', onMediaReady);
+
+    // Direct MP4 Byte-Range Stream (e.g. YouTube /api/yt/stream/:videoId)
+    if (isDirectMp4) {
+      let mp4Retries = 0;
+      let retryTimer: number | null = null;
+
+      const handleLoadedMetadata = () => {
+        if (destroyed || !videoRef.current) return;
+        const dur = videoRef.current.duration;
+        if (Number.isFinite(dur) && dur > 10) {
+          onDurationDetectedRef.current?.(Math.round(dur));
+        }
+        if (!isLive && initialStartRef.current > 2) {
+          const maxSeek = Number.isFinite(dur) && dur > 8 ? dur - 5 : initialStartRef.current;
+          videoRef.current.currentTime = Math.max(0, Math.min(initialStartRef.current, maxSeek));
+        }
+      };
+
+      const handleVideoElementError = () => {
+        if (destroyed || !videoRef.current) return;
+        if (mp4Retries < 2) {
+          mp4Retries += 1;
+          retryTimer = window.setTimeout(() => {
+            if (destroyed || !videoRef.current) return;
+            const sep = manifestUrl.includes('?') ? '&' : '?';
+            videoRef.current.src = `${manifestUrl}${sep}r=${mp4Retries}`;
+            videoRef.current.load();
+          }, 900 * mp4Retries);
+        } else {
+          onStreamErrorRef.current?.();
+        }
+      };
+
+      video.preload = 'auto';
+      video.addEventListener('loadedmetadata', handleLoadedMetadata);
+      video.addEventListener('error', handleVideoElementError);
+      video.src = manifestUrl;
+      video.load();
+
+      return () => {
+        destroyed = true;
+        if (retryTimer) window.clearTimeout(retryTimer);
+        video.removeEventListener('canplay', onMediaReady);
+        video.removeEventListener('loadedmetadata', handleLoadedMetadata);
+        video.removeEventListener('error', handleVideoElementError);
+        video.removeAttribute('src');
+        video.load();
+      };
+    }
 
     if (Hls.isSupported()) {
       const startPos = isLive ? -1 : Math.max(0, initialStartRef.current);

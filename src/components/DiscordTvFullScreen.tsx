@@ -12,10 +12,21 @@ import {
   Tv,
   Minimize2,
   Play,
+  Plus,
+  Search,
+  Trash2,
 } from 'lucide-react';
 import type { BroadcastMode, BroadcastState } from '../types/broadcast';
 import { HlsVideoStream } from './HlsVideoStream';
 import { isRunningInDiscordProxy } from '../hooks/useDiscordActivity';
+
+interface YoutubeSearchItem {
+  videoId: string;
+  title: string;
+  channelName: string;
+  durationSeconds: number;
+  views: number;
+}
 
 function formatTimecode(totalSeconds: number): string {
   const safe = Math.max(0, Math.floor(totalSeconds));
@@ -28,6 +39,14 @@ function formatTimecode(totalSeconds: number): string {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+function looksLikeMediaUrlOrId(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) return true;
+  if (/^\d{8,14}$/.test(trimmed)) return true;
+  return /^(https?:\/\/)?(www\.|m\.)?(youtube\.com|youtu\.be|twitch\.tv)\//i.test(trimmed);
+}
+
 interface DiscordTvFullScreenProps {
   broadcast: BroadcastState;
   clockOffsetMs: number;
@@ -38,7 +57,9 @@ interface DiscordTvFullScreenProps {
   onNext: () => void;
   onSeekSeconds: (seconds: number) => void;
   onSelectVideo: (videoId: string) => void;
-  onAddMediaNow: (url: string) => Promise<{ ok: boolean; message: string }>;
+  onAddMedia: (url: string, playNow: boolean) => Promise<{ ok: boolean; message: string }>;
+  onRemoveVideo: (videoId: string) => void;
+  onReportDuration: (videoId: string, durationSeconds: number) => void;
   onVideoEnded: (videoId: string) => void;
   onVideoError: (videoId: string) => void;
 }
@@ -53,7 +74,9 @@ export function DiscordTvFullScreen({
   onNext,
   onSeekSeconds,
   onSelectVideo,
-  onAddMediaNow,
+  onAddMedia,
+  onRemoveVideo,
+  onReportDuration,
   onVideoEnded,
   onVideoError,
 }: DiscordTvFullScreenProps) {
@@ -63,35 +86,20 @@ export function DiscordTvFullScreen({
   const [controlsVisible, setControlsVisible] = useState<boolean>(true);
   const [drawerOpen, setDrawerOpen] = useState<boolean>(false);
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
+
   const [customLinkInput, setCustomLinkInput] = useState<string>('');
   const [customLinkStatus, setCustomLinkStatus] = useState<string | null>(null);
   const [isSubmittingLink, setIsSubmittingLink] = useState<boolean>(false);
+  const [searchResults, setSearchResults] = useState<YoutubeSearchItem[]>([]);
+  const [isSearching, setIsSearching] = useState<boolean>(false);
 
   const hideTimerRef = useRef<number | null>(null);
   const apiBase = isRunningInDiscordProxy() ? '/.proxy' : '';
 
-  const hlsCompatiblePlaylist = useMemo(
-    () =>
-      broadcast.playlist.filter((v) =>
-        Boolean(v.twitchVodId || v.twitchChannelLogin)
-      ),
-    [broadcast.playlist]
+  const activeVodItem = useMemo(
+    () => broadcast.playlist[broadcast.currentIndex] || broadcast.playlist[0] || null,
+    [broadcast.playlist, broadcast.currentIndex]
   );
-
-  const rawSelectedItem = broadcast.playlist[broadcast.currentIndex] || null;
-  const isRawYoutubeOnly = Boolean(
-    rawSelectedItem &&
-      !rawSelectedItem.twitchVodId &&
-      !rawSelectedItem.twitchChannelLogin &&
-      !(broadcast.activeSource === 'twitch' && broadcast.twitch.isLive)
-  );
-
-  const activeVodItem = useMemo(() => {
-    if (rawSelectedItem?.twitchVodId || rawSelectedItem?.twitchChannelLogin) {
-      return rawSelectedItem;
-    }
-    return hlsCompatiblePlaylist[0] || null;
-  }, [rawSelectedItem, hlsCompatiblePlaylist]);
 
   const isPlayingTwitchLive =
     broadcast.activeSource === 'twitch' && broadcast.twitch.isLive;
@@ -135,10 +143,14 @@ export function DiscordTvFullScreen({
     if (activeVodItem?.twitchVodId) {
       return `${apiBase}/api/hls/vod-${activeVodItem.twitchVodId}.m3u8`;
     }
+    if (activeVodItem?.id) {
+      return `${apiBase}/api/yt/stream/${encodeURIComponent(activeVodItem.id)}`;
+    }
     return '';
   }, [
     apiBase,
     isPlayingTwitchLive,
+    activeVodItem?.id,
     activeVodItem?.twitchChannelLogin,
     activeVodItem?.twitchVodId,
   ]);
@@ -162,16 +174,24 @@ export function DiscordTvFullScreen({
     reloadNonce,
   ]);
 
-  const handleDirectLinkSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const trimmed = customLinkInput.trim();
+  const submitUrlAction = async (rawInput: string, playNow: boolean) => {
+    const trimmed = rawInput.trim();
     if (!trimmed || isSubmittingLink) return;
+    const normalized =
+      /^(www\.|m\.)?(youtube\.com|youtu\.be|twitch\.tv)\//i.test(trimmed)
+        ? `https://${trimmed}`
+        : trimmed;
+
     setIsSubmittingLink(true);
     try {
-      const res = await onAddMediaNow(trimmed);
+      const res = await onAddMedia(normalized, playNow);
       setCustomLinkStatus(res.message);
       if (res.ok) {
         setCustomLinkInput('');
+        setSearchResults([]);
+        if (playNow) {
+          setDrawerOpen(false);
+        }
       }
       window.setTimeout(() => setCustomLinkStatus(null), 5000);
     } finally {
@@ -179,6 +199,42 @@ export function DiscordTvFullScreen({
     }
   };
 
+  const handleSearchYoutube = async (query: string) => {
+    const trimmed = query.trim();
+    if (!trimmed || isSearching) return;
+    setIsSearching(true);
+    setCustomLinkStatus(null);
+    try {
+      const res = await fetch(
+        `${apiBase}/api/tv/youtube-search?q=${encodeURIComponent(trimmed)}`
+      );
+      if (res.ok) {
+        const data = (await res.json()) as { results?: YoutubeSearchItem[] };
+        const items = data.results || [];
+        setSearchResults(items);
+        if (items.length === 0) {
+          setCustomLinkStatus('Aucun résultat YouTube trouvé pour cette recherche.');
+        }
+      }
+    } catch {
+      setCustomLinkStatus('Erreur réseau lors de la recherche YouTube.');
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  const handlePrimarySubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = customLinkInput.trim();
+    if (!trimmed) return;
+    if (looksLikeMediaUrlOrId(trimmed)) {
+      await submitUrlAction(trimmed, true);
+    } else {
+      await handleSearchYoutube(trimmed);
+    }
+  };
+
+  const isUrlInput = looksLikeMediaUrlOrId(customLinkInput);
   const showOverlay = controlsVisible || drawerOpen || isMuted;
 
   return (
@@ -197,6 +253,11 @@ export function DiscordTvFullScreen({
           volume={volumePercent / 100}
           reloadKey={reloadNonce}
           onMutedChange={setIsMuted}
+          onDurationDetected={(dur) => {
+            if (activeVodItem && !isLiveStream) {
+              onReportDuration(activeVodItem.id, dur);
+            }
+          }}
           onEnded={() => {
             if (activeVodItem) onVideoEnded(activeVodItem.id);
           }}
@@ -242,14 +303,6 @@ export function DiscordTvFullScreen({
                 <Users className="w-3.5 h-3.5 shrink-0" />
                 {broadcast.connectedViewers}
               </span>
-              {isRawYoutubeOnly && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span className="text-amber-300">
-                    Flux Twitch maintenu sur Discord (YouTube externe actif sur le web)
-                  </span>
-                </>
-              )}
             </div>
             <h1 className="text-sm sm:text-base font-semibold text-white truncate max-w-2xl">
               {isPlayingTwitchLive
@@ -417,17 +470,17 @@ export function DiscordTvFullScreen({
         </div>
       </div>
 
-      {/* Compact Slide-Over Program Guide Drawer */}
+      {/* Compact Slide-Over Program Guide & YouTube/Twitch Launcher Drawer */}
       {drawerOpen && (
         <div
           onClick={(e) => e.stopPropagation()}
-          className="absolute top-0 right-0 bottom-0 w-full max-w-sm bg-slate-950/95 border-l border-slate-800 z-30 flex flex-col"
+          className="absolute top-0 right-0 bottom-0 w-full max-w-md bg-slate-950/95 border-l border-slate-800 z-30 flex flex-col"
         >
           <div className="px-4 py-3.5 border-b border-slate-800 flex items-center justify-between gap-2">
             <div>
-              <h2 className="text-sm font-semibold text-white">Choix du programme TV</h2>
+              <h2 className="text-sm font-semibold text-white">Grille & Ajout de vidéos</h2>
               <p className="text-xs text-slate-400">
-                Synchronisé pour tout le salon vocal
+                YouTube & Twitch synchronisés pour tout le salon vocal
               </p>
             </div>
             <button
@@ -460,69 +513,167 @@ export function DiscordTvFullScreen({
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              Rediffusions JLM
+              Grille Vidéos JLM
             </button>
           </div>
 
-          {/* Direct Launch Box inside Discord Activity */}
+          {/* Direct YouTube / Twitch URL or Search Box inside Discord Activity */}
           <form
-            onSubmit={handleDirectLinkSubmit}
+            onSubmit={handlePrimarySubmit}
             className="p-3.5 border-b border-slate-800 bg-slate-900/40 space-y-2"
           >
             <label className="block text-[11px] font-medium text-slate-300">
-              Diffuser un direct ou une rediffusion Twitch maintenant
+              Coller un lien YouTube / Twitch ou rechercher une vidéo
             </label>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5">
               <input
                 type="text"
                 value={customLinkInput}
                 onChange={(e) => setCustomLinkInput(e.target.value)}
-                placeholder="https://www.twitch.tv/..."
+                placeholder="https://www.youtube.com/watch?v=... ou recherche"
                 className="flex-1 min-w-0 px-2.5 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
               />
-              <button
-                type="submit"
-                disabled={isSubmittingLink}
-                className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-white bg-rose-600 hover:bg-rose-500 rounded-lg transition-colors cursor-pointer shrink-0 disabled:opacity-50"
-              >
-                <Play className="w-3 h-3 fill-current shrink-0" />
-                <span>Lancer</span>
-              </button>
+              {isUrlInput ? (
+                <>
+                  <button
+                    type="submit"
+                    disabled={isSubmittingLink}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-white bg-rose-600 hover:bg-rose-500 rounded-lg transition-colors cursor-pointer shrink-0 disabled:opacity-50"
+                  >
+                    <Play className="w-3 h-3 fill-current shrink-0" />
+                    <span>{isSubmittingLink ? '...' : 'Diffuser'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isSubmittingLink}
+                    onClick={() => void submitUrlAction(customLinkInput, false)}
+                    title="Ajouter à la grille sans couper la vidéo en cours"
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors cursor-pointer shrink-0 disabled:opacity-50"
+                  >
+                    <Plus className="w-3.5 h-3.5 shrink-0" />
+                    <span>Grille</span>
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={isSearching || !customLinkInput.trim()}
+                  className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-white bg-rose-600 hover:bg-rose-500 rounded-lg transition-colors cursor-pointer shrink-0 disabled:opacity-50"
+                >
+                  <Search className="w-3.5 h-3.5 shrink-0" />
+                  <span>{isSearching ? '...' : 'Chercher'}</span>
+                </button>
+              )}
             </div>
+
             {customLinkStatus && (
-              <p className="text-[11px] text-amber-300 leading-snug">{customLinkStatus}</p>
+              <p className="text-[11px] text-emerald-400 leading-snug">{customLinkStatus}</p>
+            )}
+
+            {searchResults.length > 0 && (
+              <div className="pt-1 space-y-1.5 max-h-52 overflow-y-auto border-t border-slate-800/80">
+                <div className="flex items-center justify-between text-[11px] text-slate-400">
+                  <span>Résultats YouTube</span>
+                  <button
+                    type="button"
+                    onClick={() => setSearchResults([])}
+                    className="text-slate-400 hover:text-white cursor-pointer"
+                  >
+                    Fermer
+                  </button>
+                </div>
+                {searchResults.map((resItem) => (
+                  <div
+                    key={resItem.videoId}
+                    className="p-2 rounded-lg bg-slate-950/90 border border-slate-800/80 flex items-center justify-between gap-2"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-medium text-slate-100 line-clamp-2 leading-snug">
+                        {resItem.title}
+                      </p>
+                      <p className="text-[11px] text-slate-400 truncate">
+                        {resItem.channelName} · {formatTimecode(resItem.durationSeconds)}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        disabled={isSubmittingLink}
+                        onClick={() =>
+                          void submitUrlAction(
+                            `https://www.youtube.com/watch?v=${resItem.videoId}`,
+                            true
+                          )
+                        }
+                        className="px-2 py-1 text-[11px] font-medium text-white bg-rose-600 hover:bg-rose-500 rounded cursor-pointer disabled:opacity-50"
+                      >
+                        Diffuser
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isSubmittingLink}
+                        onClick={() =>
+                          void submitUrlAction(
+                            `https://www.youtube.com/watch?v=${resItem.videoId}`,
+                            false
+                          )
+                        }
+                        title="Ajouter à la grille"
+                        className="p-1 text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded cursor-pointer disabled:opacity-50"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
             )}
           </form>
 
           <div className="flex-1 overflow-y-auto divide-y divide-slate-800/70">
-            {hlsCompatiblePlaylist.map((item, idx) => {
+            {broadcast.playlist.map((item, idx) => {
               const isSelected = activeVodItem?.id === item.id && !isPlayingTwitchLive;
               return (
-                <button
+                <div
                   key={item.id}
-                  type="button"
-                  onClick={() => {
-                    onSelectVideo(item.id);
-                    setDrawerOpen(false);
-                  }}
-                  className={`w-full text-left px-4 py-3 flex items-start gap-3 transition-colors cursor-pointer ${
+                  className={`w-full px-4 py-3 flex items-start gap-3 transition-colors ${
                     isSelected ? 'bg-slate-800/90' : 'hover:bg-slate-900'
                   }`}
                 >
-                  <span className="text-xs font-mono tabular-nums text-slate-500 pt-0.5 w-5 shrink-0">
-                    {String(idx + 1).padStart(2, '0')}
-                  </span>
-                  <div className="min-w-0 flex-1 space-y-1">
-                    <p className="text-xs font-medium text-slate-100 line-clamp-2 leading-snug">
-                      {item.title}
-                    </p>
-                    <p className="text-[11px] font-mono tabular-nums text-slate-400">
-                      {item.twitchChannelLogin
-                        ? `Direct Twitch · ${item.twitchChannelLogin}`
-                        : `Durée ${formatTimecode(item.durationSeconds)} · ${item.views.toLocaleString('fr-FR')} vues`}
-                    </p>
-                  </div>
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onSelectVideo(item.id);
+                      setDrawerOpen(false);
+                    }}
+                    className="flex-1 min-w-0 text-left flex items-start gap-3 cursor-pointer"
+                  >
+                    <span className="text-xs font-mono tabular-nums text-slate-500 pt-0.5 w-5 shrink-0">
+                      {String(idx + 1).padStart(2, '0')}
+                    </span>
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <p className="text-xs font-medium text-slate-100 line-clamp-2 leading-snug">
+                        {item.title}
+                      </p>
+                      <p className="text-[11px] font-mono tabular-nums text-slate-400">
+                        {item.twitchChannelLogin
+                          ? `Direct Twitch · ${item.twitchChannelLogin}`
+                          : `${item.sourceType === 'custom' ? 'Ajouté · ' : ''}Durée ${formatTimecode(item.durationSeconds)}`}
+                      </p>
+                    </div>
+                  </button>
+
+                  {item.sourceType === 'custom' && broadcast.playlist.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => onRemoveVideo(item.id)}
+                      title="Retirer de la grille"
+                      className="p-1.5 text-slate-500 hover:text-rose-400 rounded transition-colors cursor-pointer shrink-0"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
               );
             })}
           </div>

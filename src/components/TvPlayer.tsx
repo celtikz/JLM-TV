@@ -16,69 +16,6 @@ import { HlsVideoStream } from './HlsVideoStream';
 
 const STUDIO_SLATE_IMG = '/src/assets/images/tv_broadcast_slate_1793131336238.jpg';
 
-declare global {
-  interface Window {
-    YT?: {
-      Player: new (
-        element: HTMLElement | string,
-        options: {
-          videoId: string;
-          playerVars?: Record<string, string | number>;
-          events?: {
-            onReady?: (e: { target: YTPlayerInstance }) => void;
-            onStateChange?: (e: { data: number; target: YTPlayerInstance }) => void;
-            onError?: (e: { data: number }) => void;
-          };
-        }
-      ) => YTPlayerInstance;
-      PlayerState?: {
-        ENDED: number;
-        PLAYING: number;
-      };
-    };
-    onYouTubeIframeAPIReady?: () => void;
-  }
-}
-
-interface YTPlayerInstance {
-  loadVideoById: (opts: { videoId: string; startSeconds?: number }) => void;
-  seekTo: (seconds: number, allowSeekAhead: boolean) => void;
-  getCurrentTime: () => number;
-  getDuration: () => number;
-  getPlayerState?: () => number;
-  setVolume: (volume: number) => void;
-  mute: () => void;
-  unMute: () => void;
-  isMuted: () => boolean;
-  playVideo: () => void;
-  destroy: () => void;
-}
-
-let ytApiPromise: Promise<void> | null = null;
-function loadYouTubeIframeApi(): Promise<void> {
-  if (window.YT && window.YT.Player) {
-    return Promise.resolve();
-  }
-  if (ytApiPromise) return ytApiPromise;
-
-  ytApiPromise = new Promise<void>((resolve) => {
-    const prevCallback = window.onYouTubeIframeAPIReady;
-    window.onYouTubeIframeAPIReady = () => {
-      if (prevCallback) prevCallback();
-      resolve();
-    };
-    const existingScript = document.querySelector(
-      'script[src="https://www.youtube.com/iframe_api"]'
-    );
-    if (!existingScript) {
-      const tag = document.createElement('script');
-      tag.src = 'https://www.youtube.com/iframe_api';
-      document.head.appendChild(tag);
-    }
-  });
-  return ytApiPromise;
-}
-
 function formatTimecode(totalSeconds: number): string {
   const safe = Math.max(0, Math.floor(totalSeconds));
   const h = Math.floor(safe / 3600);
@@ -127,23 +64,12 @@ export function TvPlayer({
   const [slateImgError, setSlateImgError] = useState<boolean>(false);
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
 
-  const ytMountRef = useRef<HTMLDivElement | null>(null);
-  const ytPlayerRef = useRef<YTPlayerInstance | null>(null);
-  const currentVideoIdRef = useRef<string | null>(null);
   const targetStartRef = useRef<number>(currentVideoStartedAt);
   const clockOffsetRef = useRef<number>(clockOffsetMs);
-  const isMutedRef = useRef<boolean>(isMuted);
-  const volumePercentRef = useRef<number>(volumePercent);
-
   targetStartRef.current = currentVideoStartedAt;
   clockOffsetRef.current = clockOffsetMs;
-  isMutedRef.current = isMuted;
-  volumePercentRef.current = volumePercent;
 
   const apiBase = isRunningInDiscordProxy() ? '/.proxy' : '';
-  const useHlsForYoutubeItem = Boolean(
-    currentVideo?.twitchVodId || currentVideo?.twitchChannelLogin
-  );
 
   useEffect(() => {
     const updateClock = () => {
@@ -156,182 +82,22 @@ export function TvPlayer({
     return () => window.clearInterval(timer);
   }, [currentVideoStartedAt, clockOffsetMs]);
 
-  useEffect(() => {
-    if (
-      isRunningInDiscordProxy() ||
-      activeSource !== 'youtube' ||
-      !currentVideo ||
-      useHlsForYoutubeItem
-    ) {
-      if (ytPlayerRef.current) {
-        ytPlayerRef.current.destroy();
-        ytPlayerRef.current = null;
-        currentVideoIdRef.current = null;
-      }
-      return;
-    }
-
-    let disposed = false;
-
-    async function syncOrMountPlayer() {
-      await loadYouTubeIframeApi();
-      if (disposed || !ytMountRef.current || !window.YT || !currentVideo) return;
-
-      const serverNow = Date.now() + clockOffsetRef.current;
-      const startSec = Math.max(0, Math.floor((serverNow - targetStartRef.current) / 1000));
-
-      const ensurePlayingOrMuteFallback = (player: YTPlayerInstance) => {
-        window.setTimeout(() => {
-          if (disposed || ytPlayerRef.current !== player) return;
-          const st = player.getPlayerState?.();
-          // 1 = PLAYING, 3 = BUFFERING
-          if (st !== 1 && st !== 3) {
-            player.mute();
-            setIsMuted(true);
-            player.playVideo();
-          }
-        }, 700);
-      };
-
-      if (ytPlayerRef.current) {
-        if (currentVideoIdRef.current !== currentVideo.id) {
-          currentVideoIdRef.current = currentVideo.id;
-          ytPlayerRef.current.loadVideoById({
-            videoId: currentVideo.id,
-            startSeconds: startSec,
-          });
-          ensurePlayingOrMuteFallback(ytPlayerRef.current);
-        } else {
-          const currentPos = ytPlayerRef.current.getCurrentTime?.() ?? 0;
-          if (Math.abs(currentPos - startSec) > 5) {
-            ytPlayerRef.current.seekTo(startSec, true);
-          }
-        }
-        return;
-      }
-
-      const mountNode = document.createElement('div');
-      ytMountRef.current.innerHTML = '';
-      ytMountRef.current.appendChild(mountNode);
-      currentVideoIdRef.current = currentVideo.id;
-
-      ytPlayerRef.current = new window.YT.Player(mountNode, {
-        videoId: currentVideo.id,
-        playerVars: {
-          autoplay: 1,
-          mute: isMutedRef.current ? 1 : 0,
-          controls: 1,
-          rel: 0,
-          modestbranding: 1,
-          playsinline: 1,
-          start: startSec,
-          origin: window.location.origin,
-        },
-        events: {
-          onReady: (e) => {
-            if (disposed) return;
-            e.target.setVolume(volumePercentRef.current);
-            if (isMutedRef.current) {
-              e.target.mute();
-            } else {
-              e.target.unMute();
-            }
-            e.target.playVideo();
-            ensurePlayingOrMuteFallback(e.target);
-            const dur = e.target.getDuration();
-            if (dur > 0 && currentVideoIdRef.current) {
-              onReportDuration(currentVideoIdRef.current, dur);
-            }
-          },
-          onStateChange: (e) => {
-            if (disposed) return;
-            if (e.data === 1) {
-              const dur = e.target.getDuration();
-              if (dur > 0 && currentVideoIdRef.current) {
-                onReportDuration(currentVideoIdRef.current, dur);
-              }
-            }
-            if (e.data === 0 && currentVideoIdRef.current) {
-              onVideoEnded(currentVideoIdRef.current);
-            }
-          },
-          onError: () => {
-            if (!disposed && currentVideoIdRef.current) {
-              onVideoError(currentVideoIdRef.current);
-            }
-          },
-        },
-      });
-    }
-
-    void syncOrMountPlayer();
-
-    return () => {
-      disposed = true;
-    };
-  }, [
-    activeSource,
-    currentVideo?.id,
-    useHlsForYoutubeItem,
-    currentVideoStartedAt,
-    reloadNonce,
-    onReportDuration,
-    onVideoEnded,
-    onVideoError,
-  ]);
-
-  useEffect(() => {
-    return () => {
-      if (ytPlayerRef.current) {
-        ytPlayerRef.current.destroy();
-        ytPlayerRef.current = null;
-      }
-    };
-  }, []);
-
   const handleToggleMute = () => {
     const nextMuted = !isMuted;
-    const restoredVol = !nextMuted && volumePercent === 0 ? 50 : volumePercent;
     if (!nextMuted && volumePercent === 0) {
       setVolumePercent(50);
     }
     setIsMuted(nextMuted);
-    if (activeSource === 'youtube' && !useHlsForYoutubeItem && ytPlayerRef.current) {
-      if (nextMuted) {
-        ytPlayerRef.current.mute();
-      } else {
-        ytPlayerRef.current.setVolume(restoredVol);
-        ytPlayerRef.current.unMute();
-        ytPlayerRef.current.playVideo();
-      }
-    }
   };
 
   const handleVolumeChange = (nextPercent: number) => {
     const clamped = Math.max(0, Math.min(100, Math.round(nextPercent)));
     setVolumePercent(clamped);
-    const muted = clamped === 0;
-    setIsMuted(muted);
-    if (activeSource === 'youtube' && !useHlsForYoutubeItem && ytPlayerRef.current) {
-      ytPlayerRef.current.setVolume(clamped);
-      if (muted) {
-        ytPlayerRef.current.mute();
-      } else {
-        ytPlayerRef.current.unMute();
-        ytPlayerRef.current.playVideo();
-      }
-    }
+    setIsMuted(clamped === 0);
   };
 
   const handleResync = () => {
-    if (activeSource === 'youtube' && !useHlsForYoutubeItem && ytPlayerRef.current) {
-      const serverNow = Date.now() + clockOffsetMs;
-      const startSec = Math.max(0, Math.floor((serverNow - currentVideoStartedAt) / 1000));
-      ytPlayerRef.current.seekTo(startSec, true);
-      ytPlayerRef.current.playVideo();
-    } else {
-      setReloadNonce((n) => n + 1);
-    }
+    setReloadNonce((n) => n + 1);
   };
 
   const targetVodStartSec = useMemo(() => {
@@ -345,6 +111,22 @@ export function TvPlayer({
     currentVideoStartedAt,
     clockOffsetMs,
     reloadNonce,
+  ]);
+
+  const videoStreamUrl = useMemo(() => {
+    if (!currentVideo) return '';
+    if (currentVideo.twitchChannelLogin) {
+      return `${apiBase}/api/hls/channel-${currentVideo.twitchChannelLogin}.m3u8`;
+    }
+    if (currentVideo.twitchVodId) {
+      return `${apiBase}/api/hls/vod-${currentVideo.twitchVodId}.m3u8`;
+    }
+    return `${apiBase}/api/yt/stream/${encodeURIComponent(currentVideo.id)}`;
+  }, [
+    apiBase,
+    currentVideo?.id,
+    currentVideo?.twitchChannelLogin,
+    currentVideo?.twitchVodId,
   ]);
 
   const showOfflineSlate = activeSource === 'twitch' && !twitch.isLive;
@@ -403,27 +185,23 @@ export function TvPlayer({
               onMutedChange={setIsMuted}
             />
           )
-        ) : useHlsForYoutubeItem && currentVideo ? (
+        ) : currentVideo && videoStreamUrl ? (
           <HlsVideoStream
-            manifestUrl={
-              currentVideo.twitchChannelLogin
-                ? `${apiBase}/api/hls/channel-${currentVideo.twitchChannelLogin}.m3u8`
-                : `${apiBase}/api/hls/vod-${currentVideo.twitchVodId}.m3u8`
-            }
+            manifestUrl={videoStreamUrl}
             isLive={Boolean(currentVideo.twitchChannelLogin)}
             targetStartSeconds={currentVideo.twitchChannelLogin ? 0 : targetVodStartSec}
             isMuted={isMuted}
             volume={volumePercent / 100}
             reloadKey={reloadNonce}
             onMutedChange={setIsMuted}
+            onDurationDetected={(dur) => onReportDuration(currentVideo.id, dur)}
             onEnded={() => onVideoEnded(currentVideo.id)}
             onStreamError={() => onVideoError(currentVideo.id)}
           />
         ) : (
-          <div
-            ref={ytMountRef}
-            className="w-full h-full [&>div]:w-full [&>div]:h-full [&_iframe]:w-full [&_iframe]:h-full [&_iframe]:border-0"
-          />
+          <div className="w-full h-full flex items-center justify-center bg-black text-sm text-slate-400">
+            Chargement de la grille H24...
+          </div>
         )}
       </div>
 
@@ -479,7 +257,7 @@ export function TvPlayer({
                   <>
                     <span aria-hidden="true">·</span>
                     <span className="font-mono tabular-nums text-slate-300">
-                      Position {formatTimecode(elapsedSeconds)} /{' '}
+                      Position {formatTimecode(elapsedSeconds % Math.max(1, currentVideo.durationSeconds))} /{' '}
                       {formatTimecode(currentVideo.durationSeconds)}
                     </span>
                   </>
@@ -507,7 +285,11 @@ export function TvPlayer({
                   : 'text-slate-200 hover:text-white'
               }`}
             >
-              {isMuted ? <VolumeX className="w-4 h-4 shrink-0" /> : <Volume2 className="w-4 h-4 shrink-0" />}
+              {isMuted ? (
+                <VolumeX className="w-4 h-4 shrink-0" />
+              ) : (
+                <Volume2 className="w-4 h-4 shrink-0" />
+              )}
             </button>
             <input
               type="range"
@@ -539,7 +321,8 @@ export function TvPlayer({
                 type="button"
                 onClick={() => {
                   if (currentVideo) {
-                    onSeekSeconds(elapsedSeconds + 300);
+                    const pos = elapsedSeconds % Math.max(1, currentVideo.durationSeconds);
+                    onSeekSeconds(pos + 300);
                   }
                 }}
                 title="Avancer de 5 minutes"

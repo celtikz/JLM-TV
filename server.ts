@@ -114,6 +114,44 @@ function findMatchingTwitchArchive(youtubeTitle: string): YouTubeVideoItem | nul
   return bestMatch;
 }
 
+const CUSTOM_VIDEOS_FILE = path.join(process.cwd(), 'data', 'custom-videos.json');
+
+const DEFAULT_CUSTOM_VIDEOS: YouTubeVideoItem[] = [
+  {
+    id: '5qS3PZkpC64',
+    title: 'Jean-Luc Mélenchon : discussion sans filtre avec François Lenglet (Présidentielle 2027)',
+    publishedAt: '2026-10-25T18:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/5qS3PZkpC64/hqdefault.jpg',
+    views: 1200000,
+    durationSeconds: 8614,
+    sourceType: 'custom',
+  },
+];
+
+function loadSavedCustomVideos(): YouTubeVideoItem[] {
+  try {
+    if (fs.existsSync(CUSTOM_VIDEOS_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(CUSTOM_VIDEOS_FILE, 'utf-8')) as unknown;
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed as YouTubeVideoItem[];
+      }
+    }
+  } catch {
+    // Fallback to default curated custom videos
+  }
+  return [...DEFAULT_CUSTOM_VIDEOS];
+}
+
+function saveCustomVideos(playlist: YouTubeVideoItem[]): void {
+  try {
+    const customItems = playlist.filter((v) => v.sourceType === 'custom');
+    fs.mkdirSync(path.dirname(CUSTOM_VIDEOS_FILE), { recursive: true });
+    fs.writeFileSync(CUSTOM_VIDEOS_FILE, JSON.stringify(customItems, null, 2), 'utf-8');
+  } catch {
+    // Non-fatal on read-only filesystems
+  }
+}
+
 const FALLBACK_VIDEOS: YouTubeVideoItem[] = [
   {
     id: 'vod-2906055180',
@@ -186,6 +224,11 @@ function getProgramEntryOffsetSeconds(video?: YouTubeVideoItem | null): number {
   return 0;
 }
 
+const initialPlaylist: YouTubeVideoItem[] = [
+  ...loadSavedCustomVideos(),
+  ...FALLBACK_VIDEOS,
+];
+
 let state: BroadcastState = {
   mode: 'auto',
   activeSource: 'youtube',
@@ -200,10 +243,10 @@ let state: BroadcastState = {
     profileImageUrl: '',
     lastCheckedAt: new Date().toISOString(),
   },
-  playlist: [...FALLBACK_VIDEOS],
+  playlist: initialPlaylist,
   currentIndex: 0,
   currentVideoStartedAt:
-    Date.now() - getProgramEntryOffsetSeconds(FALLBACK_VIDEOS[0]) * 1000,
+    Date.now() - getProgramEntryOffsetSeconds(initialPlaylist[0]) * 1000,
   serverTime: Date.now(),
   connectedViewers: 0,
   shuffleYoutube: false,
@@ -266,19 +309,10 @@ function rebuildCombinedPlaylist() {
   }
 }
 
-function advancePlaylist(reason: string, direction: 1 | -1 = 1, requireHls = false) {
+function advancePlaylist(reason: string, direction: 1 | -1 = 1, _requireHls = false) {
   if (state.playlist.length === 0) return;
 
-  const candidateIndices = state.playlist
-    .map((item, idx) => ({ item, idx }))
-    .filter(
-      ({ item }) => !requireHls || Boolean(item.twitchVodId || item.twitchChannelLogin)
-    );
-
-  const pool =
-    candidateIndices.length > 0
-      ? candidateIndices
-      : state.playlist.map((item, idx) => ({ item, idx }));
+  const pool = state.playlist.map((item, idx) => ({ item, idx }));
 
   if (state.shuffleYoutube && pool.length > 1 && direction === 1) {
     const others = pool.filter((p) => p.idx !== state.currentIndex);
@@ -509,18 +543,94 @@ async function syncYoutubeFeed(): Promise<void> {
   }
 }
 
-async function fetchYoutubeOEmbedTitle(videoId: string): Promise<string> {
+async function fetchYoutubeVideoDetails(videoId: string): Promise<{
+  title: string;
+  durationSeconds: number;
+  views: number;
+}> {
+  const browserUa =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
+
+  // 1. Fast Piped metadata API (~200ms, returns exact durationSeconds + views + title)
   try {
-    const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(
-      `https://www.youtube.com/watch?v=${videoId}`
-    )}&format=json`;
-    const res = await fetch(oembedUrl);
-    if (!res.ok) return `Vidéo YouTube (${videoId})`;
-    const data = (await res.json()) as { title?: string };
-    return data.title ? data.title.trim() : `Vidéo YouTube (${videoId})`;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 3800);
+    const res = await fetch(`https://api.piped.private.coffee/streams/${videoId}`, {
+      signal: ac.signal,
+      headers: { 'User-Agent': browserUa },
+    });
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = (await res.json()) as {
+        title?: string;
+        duration?: number;
+        views?: number;
+      };
+      if (data.title && data.duration && data.duration > 0) {
+        durationCache.set(videoId, Math.round(data.duration));
+        return {
+          title: data.title.trim(),
+          durationSeconds: Math.round(data.duration),
+          views: data.views ?? 0,
+        };
+      }
+    }
   } catch {
-    return `Vidéo YouTube (${videoId})`;
+    // Fallback below
   }
+
+  // 2. Fallback: PokeTube OpenGraph meta + YouTube OEmbed
+  let fallbackDuration = durationCache.get(videoId) ?? 3600;
+  let fallbackTitle = '';
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 3500);
+    const pokeRes = await fetch(`https://poketube.fun/watch?v=${videoId}`, {
+      signal: ac.signal,
+      headers: { 'User-Agent': browserUa },
+    });
+    clearTimeout(timer);
+    if (pokeRes.ok) {
+      const html = await pokeRes.text();
+      const titleMeta = html.match(/property="og:title"\s+content="([^"]+)"/i);
+      if (titleMeta?.[1]) {
+        fallbackTitle = decodeXmlEntities(titleMeta[1].replace(/\s*\|\s*Poke$/i, '').trim());
+      }
+      const descMeta = html.match(/Watch this (\d{1,2}):(\d{2})(?::(\d{2}))? long video/i);
+      if (descMeta) {
+        const sec = descMeta[3]
+          ? Number(descMeta[1]) * 3600 + Number(descMeta[2]) * 60 + Number(descMeta[3])
+          : Number(descMeta[1]) * 60 + Number(descMeta[2]);
+        if (sec > 0) {
+          fallbackDuration = sec;
+          durationCache.set(videoId, sec);
+        }
+      }
+    }
+  } catch {
+    // Continue to OEmbed
+  }
+
+  if (!fallbackTitle) {
+    try {
+      const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(
+        `https://www.youtube.com/watch?v=${videoId}`
+      )}&format=json`;
+      const res = await fetch(oembedUrl);
+      if (res.ok) {
+        const data = (await res.json()) as { title?: string };
+        if (data.title) fallbackTitle = data.title.trim();
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  return {
+    title: fallbackTitle || `Vidéo YouTube (${videoId})`,
+    durationSeconds: fallbackDuration,
+    views: 0,
+  };
 }
 
 // ============================================================================
@@ -817,6 +927,267 @@ app.get('/api/hls/segment.ts', async (req, res) => {
   }
 });
 
+// ============================================================================
+// CSP-Compliant Direct YouTube MP4 Proxy (/api/yt/stream/:videoId)
+// Enables ANY YouTube video (e.g. TF1, Blast, Mediapart, JLM) inside Discord Activity
+// ============================================================================
+
+const YT_STREAM_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
+const YT_CHUNK_BYTES = 4 * 1024 * 1024; // 4 MB chunks keep Discord Cloudflare proxy fast & timeout-free
+let activeCompanionOrigin = 'https://invid-api.poketube.fun';
+let lastCompanionDiscoveryAt = 0;
+const ytStreamTotalBytesCache = new Map<string, number>();
+
+async function discoverCompanionOrigin(sampleVideoId: string): Promise<string> {
+  if (Date.now() - lastCompanionDiscoveryAt < 60_000) {
+    return activeCompanionOrigin;
+  }
+  lastCompanionDiscoveryAt = Date.now();
+
+  try {
+    const jar = new Map<string, string>();
+    const saveCookies = (res: Response) => {
+      const setCookies =
+        (res.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie?.() || [];
+      for (const c of setCookies) {
+        const kv = c.split(';')[0];
+        const eq = kv.indexOf('=');
+        if (eq > 0) {
+          const k = kv.slice(0, eq).trim();
+          const v = kv.slice(eq + 1).trim();
+          if (v) jar.set(k, v);
+        }
+      }
+    };
+    const cookieHeader = () =>
+      [...jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+
+    const target = `https://poketube.fun/watch?v=${sampleVideoId}`;
+    const r1 = await fetch(target, { headers: { 'User-Agent': YT_STREAM_UA } });
+    saveCookies(r1);
+    let html = await r1.text();
+
+    const chMatch = html.match(
+      /<script id="anubis_challenge" type="application\/json">([\s\S]*?)<\/script>/
+    );
+    if (chMatch?.[1]) {
+      const parsed = JSON.parse(chMatch[1]) as {
+        rules?: { difficulty?: number };
+        challenge?: { id?: string; randomData?: string; difficulty?: number };
+      };
+      const id = parsed.challenge?.id;
+      const randomData = parsed.challenge?.randomData;
+      const difficulty =
+        parsed.rules?.difficulty ?? parsed.challenge?.difficulty ?? 4;
+      if (id && randomData) {
+        const prefix = '0'.repeat(Math.min(6, Math.max(1, difficulty)));
+        const t0 = Date.now();
+        let nonce = 0;
+        let hash = '';
+        while (nonce < 2_000_000) {
+          hash = crypto
+            .createHash('sha256')
+            .update(randomData + String(nonce))
+            .digest('hex');
+          if (hash.startsWith(prefix)) break;
+          nonce += 1;
+        }
+        const elapsed = Math.max(15, Date.now() - t0);
+        const passUrl = `https://poketube.fun/.within.website/x/cmd/anubis/api/pass-challenge?id=${encodeURIComponent(
+          id
+        )}&response=${hash}&nonce=${nonce}&redir=${encodeURIComponent(
+          `/watch?v=${sampleVideoId}`
+        )}&elapsedTime=${elapsed}`;
+
+        const r2 = await fetch(passUrl, {
+          redirect: 'manual',
+          headers: {
+            'User-Agent': YT_STREAM_UA,
+            Cookie: cookieHeader(),
+            Referer: target,
+          },
+        });
+        saveCookies(r2);
+
+        const r3 = await fetch(target, {
+          headers: { 'User-Agent': YT_STREAM_UA, Cookie: cookieHeader() },
+        });
+        html = await r3.text();
+      }
+    }
+
+    const companionMatch = html.match(
+      /(https:\/\/[a-z0-9.-]+)\/companion\/latest_version\?/i
+    );
+    if (companionMatch?.[1]) {
+      activeCompanionOrigin = companionMatch[1];
+    }
+  } catch (err) {
+    console.warn('[YouTube Companion Discovery]:', err);
+  }
+
+  return activeCompanionOrigin;
+}
+
+app.get('/api/yt/stream/:videoId', async (req, res) => {
+  const videoId = String(req.params.videoId || '').trim();
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+    res.status(400).send('Invalid YouTube video ID');
+    return;
+  }
+
+  const abortController = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      abortController.abort();
+    }
+  });
+
+  const buildUpstreamUrl = (origin: string) =>
+    `${origin}/companion/latest_version?id=${encodeURIComponent(
+      videoId
+    )}&itag=18&local=true`;
+
+  try {
+    const rawRange = req.headers.range;
+    let start = 0;
+    let requestedEnd: number | undefined;
+    if (rawRange) {
+      const m = rawRange.match(/bytes=(\d+)-(\d*)/);
+      if (m) {
+        start = Number(m[1]);
+        if (m[2]) requestedEnd = Number(m[2]);
+      }
+    }
+
+    const knownTotal = ytStreamTotalBytesCache.get(videoId);
+    const initialMaxEnd =
+      knownTotal !== undefined
+        ? Math.min(
+            knownTotal - 1,
+            requestedEnd !== undefined
+              ? Math.min(requestedEnd, start + YT_CHUNK_BYTES - 1)
+              : start + YT_CHUNK_BYTES - 1
+          )
+        : requestedEnd !== undefined
+          ? Math.min(requestedEnd, start + YT_CHUNK_BYTES - 1)
+          : start + YT_CHUNK_BYTES - 1;
+
+    const fetchWithRange = async (origin: string, rangeHeader: string) =>
+      fetch(buildUpstreamUrl(origin), {
+        signal: abortController.signal,
+        headers: {
+          'User-Agent': YT_STREAM_UA,
+          Range: rangeHeader,
+        },
+      });
+
+    let upstream = await fetchWithRange(
+      activeCompanionOrigin,
+      `bytes=${start}-${initialMaxEnd}`
+    );
+
+    if (upstream.status >= 500 || upstream.status === 404) {
+      await upstream.body?.cancel().catch(() => {});
+      const refreshedOrigin = await discoverCompanionOrigin(videoId);
+      upstream = await fetchWithRange(
+        refreshedOrigin,
+        `bytes=${start}-${initialMaxEnd}`
+      );
+    }
+
+    let contentRange = upstream.headers.get('content-range') || '';
+    const totalMatch = contentRange.match(/\/(\d+)$/);
+
+    if (totalMatch?.[1]) {
+      ytStreamTotalBytesCache.set(videoId, Number(totalMatch[1]));
+    } else if (contentRange.endsWith('/*')) {
+      // Cold stream without cached clen on bounded range: fetch open-ended to learn exact total size
+      await upstream.body?.cancel().catch(() => {});
+      upstream = await fetchWithRange(activeCompanionOrigin, `bytes=${start}-`);
+      contentRange = upstream.headers.get('content-range') || '';
+      const openTotalMatch = contentRange.match(/\/(\d+)$/);
+      if (openTotalMatch?.[1]) {
+        const total = Number(openTotalMatch[1]);
+        ytStreamTotalBytesCache.set(videoId, total);
+        const cappedEnd = Math.min(total - 1, start + YT_CHUNK_BYTES - 1);
+        const expectedBytes = cappedEnd - start + 1;
+
+        res.status(206);
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Content-Range', `bytes ${start}-${cappedEnd}/${total}`);
+        res.setHeader('Content-Length', String(expectedBytes));
+        res.setHeader('Cache-Control', 'public, max-age=600');
+
+        if (!upstream.body) {
+          res.end();
+          return;
+        }
+
+        let bytesSent = 0;
+        const reader = upstream.body.getReader();
+        while (bytesSent < expectedBytes) {
+          const { done, value } = await reader.read();
+          if (done || !value) break;
+          const remaining = expectedBytes - bytesSent;
+          const slice = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+          bytesSent += slice.byteLength;
+          if (!res.write(slice)) {
+            await new Promise<void>((resolve) => res.once('drain', resolve));
+          }
+          if (bytesSent >= expectedBytes) {
+            await reader.cancel().catch(() => {});
+            break;
+          }
+        }
+        res.end();
+        return;
+      }
+    }
+
+    if (!upstream.ok && upstream.status !== 206) {
+      res.status(upstream.status).send('YouTube stream unavailable');
+      return;
+    }
+
+    res.status(rawRange && contentRange ? 206 : upstream.status);
+    res.setHeader(
+      'Content-Type',
+      upstream.headers.get('content-type') || 'video/mp4'
+    );
+    res.setHeader('Accept-Ranges', 'bytes');
+    if (contentRange) {
+      res.setHeader('Content-Range', contentRange);
+    }
+    const contentLength = upstream.headers.get('content-length');
+    if (contentLength) {
+      res.setHeader('Content-Length', contentLength);
+    }
+    res.setHeader('Cache-Control', 'public, max-age=600');
+
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+
+    const nodeStream = Readable.fromWeb(
+      upstream.body as unknown as NodeWebReadableStream
+    );
+    nodeStream.on('error', () => {
+      if (!res.writableEnded) res.end();
+    });
+    nodeStream.pipe(res);
+  } catch {
+    if (!res.headersSent) {
+      res.status(502).end();
+    } else if (!res.writableEnded) {
+      res.end();
+    }
+  }
+});
+
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
@@ -984,6 +1355,7 @@ wss.on('connection', (socket) => {
               state.currentVideoStartedAt =
                 Date.now() - getProgramEntryOffsetSeconds(nextCurrent) * 1000;
             }
+            saveCustomVideos(state.playlist);
             broadcastFullState();
           }
           break;
@@ -1191,6 +1563,7 @@ async function addMediaItemToPlaylist(
       appendTransition(`Vidéo Twitch ajoutée à la grille : ${title}`, state.activeSource);
     }
 
+    saveCustomVideos(state.playlist);
     broadcastFullState();
     return {
       ok: true,
@@ -1323,31 +1696,28 @@ async function addMediaItemToPlaylist(
     }
   }
 
-  // 3. YouTube Video URL or 11-char ID
+  // 3. YouTube Video URL or 11-char ID (Direct MP4 Proxy works in both Web & Discord Activity!)
   const videoId = extractYoutubeVideoId(rawUrl);
   if (!videoId) {
     return {
       ok: false,
       discordSupported: false,
       message:
-        'Lien non reconnu. Collez un lien YouTube (watch?v=...) ou un lien Twitch (twitch.tv/videos/... ou twitch.tv/chaine).',
+        'Lien non reconnu. Collez un lien YouTube (watch?v=..., youtu.be/...) ou un lien Twitch.',
     };
   }
 
   unplayableVideoIds.delete(videoId);
-  const title = await fetchYoutubeOEmbedTitle(videoId);
-  const matchedTwitchArchive = findMatchingTwitchArchive(title);
+  const details = await fetchYoutubeVideoDetails(videoId);
 
   const existingIdx = state.playlist.findIndex((v) => v.id === videoId);
   const newItem: YouTubeVideoItem = {
     id: videoId,
-    twitchVodId: matchedTwitchArchive?.twitchVodId,
-    title,
+    title: details.title,
     publishedAt: new Date().toISOString(),
     thumbnailUrl: `https://i2.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-    views: matchedTwitchArchive?.views ?? 0,
-    durationSeconds:
-      matchedTwitchArchive?.durationSeconds ?? (durationCache.get(videoId) ?? 1800),
+    views: details.views,
+    durationSeconds: details.durationSeconds,
     sourceType: 'custom',
   };
 
@@ -1361,7 +1731,9 @@ async function addMediaItemToPlaylist(
   } else {
     state.playlist[existingIdx] = {
       ...state.playlist[existingIdx],
-      twitchVodId: matchedTwitchArchive?.twitchVodId || state.playlist[existingIdx].twitchVodId,
+      title: details.title || state.playlist[existingIdx].title,
+      durationSeconds:
+        details.durationSeconds || state.playlist[existingIdx].durationSeconds,
     };
     if (playImmediately) {
       state.currentIndex = existingIdx;
@@ -1369,35 +1741,81 @@ async function addMediaItemToPlaylist(
   }
 
   if (playImmediately) {
-    state.currentVideoStartedAt = matchedTwitchArchive
-      ? Date.now() - getProgramEntryOffsetSeconds(newItem) * 1000
-      : Date.now();
+    state.currentVideoStartedAt = Date.now();
     if (state.activeSource === 'twitch') {
       state.mode = 'force_youtube';
       state.activeSource = 'youtube';
     }
-    appendTransition(`Diffusion immédiate : ${title}`, 'youtube');
+    appendTransition(`Diffusion immédiate YouTube : ${details.title}`, 'youtube');
   } else {
-    appendTransition(`Vidéo ajoutée à la grille : ${title}`, state.activeSource);
+    appendTransition(`Vidéo YouTube ajoutée à la grille : ${details.title}`, state.activeSource);
   }
 
+  saveCustomVideos(state.playlist);
   broadcastFullState();
 
-  const discordSupported = Boolean(newItem.twitchVodId);
   return {
     ok: true,
-    discordSupported,
-    message: discordSupported
-      ? `À l’antenne sur le site et sur Discord : ${title}`
-      : playImmediately
-        ? `En lecture sur le site web (${title}). Note : Discord bloque les chaînes YouTube externes dans les activités — utilisez un lien Twitch pour l’afficher aussi dans Discord.`
-        : `Ajouté à la grille web : ${title}`,
+    discordSupported: true,
+    message: playImmediately
+      ? `À l’antenne sur Discord et sur le site : ${details.title}`
+      : `Ajouté à la grille H24 (Discord & Web) : ${details.title}`,
     item: newItem,
   };
 }
 
 app.get('/api/tv/state', (_req, res) => {
   res.json(getPublicState());
+});
+
+app.get('/api/tv/youtube-search', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) {
+    res.json({ results: [] });
+    return;
+  }
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 5000);
+    const upstream = await fetch(
+      `https://api.piped.private.coffee/search?q=${encodeURIComponent(q)}&filter=videos`,
+      {
+        signal: ac.signal,
+        headers: { 'User-Agent': YT_STREAM_UA },
+      }
+    );
+    clearTimeout(timer);
+    if (!upstream.ok) {
+      res.json({ results: [] });
+      return;
+    }
+    const data = (await upstream.json()) as {
+      items?: Array<{
+        url?: string;
+        title?: string;
+        uploaderName?: string;
+        duration?: number;
+        views?: number;
+      }>;
+    };
+    const results = (data.items || [])
+      .map((item) => {
+        const vid = item.url ? extractYoutubeVideoId(`https://www.youtube.com${item.url}`) : null;
+        if (!vid || !item.title || !item.duration || item.duration <= 0) return null;
+        return {
+          videoId: vid,
+          title: item.title,
+          channelName: item.uploaderName || 'YouTube',
+          durationSeconds: Math.round(item.duration),
+          views: item.views ?? 0,
+        };
+      })
+      .filter((x): x is NonNullable<typeof x> => Boolean(x))
+      .slice(0, 8);
+    res.json({ results });
+  } catch {
+    res.json({ results: [] });
+  }
 });
 
 app.post('/api/tv/playlist/add', async (req, res) => {
