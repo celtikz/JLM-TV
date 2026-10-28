@@ -9,6 +9,7 @@ interface ProgramThumbnailProps {
   title: string;
   durationSeconds?: number;
   startTimecodeSeconds?: number;
+  savedProgressSeconds?: number;
   isCurrent?: boolean;
   isQueuedNext?: boolean;
   showHoverPlay?: boolean;
@@ -37,6 +38,7 @@ export function ProgramThumbnail({
   title,
   durationSeconds,
   startTimecodeSeconds,
+  savedProgressSeconds,
   isCurrent = false,
   isQueuedNext = false,
   showHoverPlay = true,
@@ -52,6 +54,14 @@ export function ProgramThumbnail({
   useEffect(() => {
     setImgError(false);
   }, [resolvedSrc]);
+
+  const progressRatio =
+    typeof savedProgressSeconds === 'number' &&
+    savedProgressSeconds >= 5 &&
+    typeof durationSeconds === 'number' &&
+    durationSeconds > 30
+      ? Math.max(0.02, Math.min(1, savedProgressSeconds / durationSeconds))
+      : 0;
 
   return (
     <div
@@ -89,24 +99,47 @@ export function ProgramThumbnail({
 
       {/* Status or Start Timecode Overlay (Bottom-Left) */}
       {isCurrent ? (
-        <span className="absolute bottom-1.5 left-1.5 px-1.5 py-0.5 rounded bg-white text-black text-[10px] font-mono font-bold tracking-wide uppercase shadow">
+        <span className="absolute bottom-2 left-1.5 px-1.5 py-0.5 rounded bg-white text-black text-[10px] font-mono font-bold tracking-wide uppercase shadow">
           À l’antenne
         </span>
       ) : isQueuedNext ? (
-        <span className="absolute bottom-1.5 left-1.5 px-1.5 py-0.5 rounded bg-black/90 text-white border border-white/30 text-[10px] font-mono font-semibold tracking-wide uppercase shadow">
+        <span className="absolute bottom-2 left-1.5 px-1.5 py-0.5 rounded bg-black/90 text-white border border-white/30 text-[10px] font-mono font-semibold tracking-wide uppercase shadow">
           À suivre
         </span>
       ) : typeof startTimecodeSeconds === 'number' ? (
-        <span className="absolute bottom-1.5 left-1.5 px-1.5 py-0.5 rounded bg-white text-black text-[11px] font-mono tabular-nums font-bold leading-none shadow">
+        <span className="absolute bottom-2 left-1.5 px-1.5 py-0.5 rounded bg-white text-black text-[11px] font-mono tabular-nums font-bold leading-none shadow">
           À {formatTimecode(startTimecodeSeconds)}
+        </span>
+      ) : progressRatio > 0 && typeof savedProgressSeconds === 'number' ? (
+        <span className="absolute bottom-2 left-1.5 px-1.5 py-0.5 rounded bg-black/90 text-neutral-200 border border-white/20 text-[10px] font-mono tabular-nums font-medium leading-none shadow">
+          Reprise {formatTimecode(savedProgressSeconds)}
         </span>
       ) : null}
 
       {/* Duration Overlay (Bottom-Right, YouTube-style) */}
       {typeof durationSeconds === 'number' && durationSeconds > 0 && (
-        <span className="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded bg-black/85 text-white text-[11px] font-mono tabular-nums font-medium leading-none shadow">
+        <span className="absolute bottom-2 right-1.5 px-1.5 py-0.5 rounded bg-black/85 text-white text-[11px] font-mono tabular-nums font-medium leading-none shadow">
           {formatTimecode(durationSeconds)}
         </span>
+      )}
+
+      {/* Saved User Watch Progress Bar along Bottom Edge */}
+      {progressRatio > 0 && (
+        <svg
+          viewBox="0 0 1000 30"
+          preserveAspectRatio="none"
+          className="absolute inset-x-0 bottom-0 w-full h-1 pointer-events-none"
+          aria-hidden="true"
+        >
+          <rect x={0} y={0} width={1000} height={30} className="fill-white/25" />
+          <rect
+            x={0}
+            y={0}
+            width={Math.round(progressRatio * 1000)}
+            height={30}
+            className="fill-white"
+          />
+        </svg>
       )}
     </div>
   );

@@ -1778,9 +1778,23 @@ app.get('/api/hls/segment.ts', async (req, res) => {
 const YT_STREAM_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
 const YT_CHUNK_BYTES = 4 * 1024 * 1024; // 4 MB chunks keep Discord Cloudflare proxy fast & timeout-free
+const ALLOWED_YT_ITAGS = new Set<number>([299, 137, 298, 136, 135, 134, 22, 18, 140]);
+
+interface YoutubeResolvedQuality {
+  height: 1080 | 720 | 480 | 360;
+  label: string;
+  videoItag: number;
+  audioItag: number | null;
+  fps: number;
+}
+
 let activeCompanionOrigin = 'https://invid-api.poketube.fun';
 let lastCompanionDiscoveryAt = 0;
 const ytStreamTotalBytesCache = new Map<string, number>();
+const ytQualitiesCache = new Map<
+  string,
+  { qualities: YoutubeResolvedQuality[]; expiresAt: number }
+>();
 
 async function discoverCompanionOrigin(sampleVideoId: string): Promise<string> {
   if (Date.now() - lastCompanionDiscoveryAt < 60_000) {
@@ -1873,12 +1887,142 @@ async function discoverCompanionOrigin(sampleVideoId: string): Promise<string> {
   return activeCompanionOrigin;
 }
 
+async function resolveYoutubeQualities(videoId: string): Promise<YoutubeResolvedQuality[]> {
+  const cached = ytQualitiesCache.get(videoId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.qualities;
+  }
+
+  const probeItagsOnOrigin = async (origin: string): Promise<Set<number>> => {
+    const candidates = [299, 137, 298, 136, 135, 18, 140];
+    const available = new Set<number>();
+
+    await Promise.all(
+      candidates.map(async (itag) => {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 3400);
+        try {
+          const url = `${origin}/companion/latest_version?id=${encodeURIComponent(
+            videoId
+          )}&itag=${itag}&local=true`;
+          const res = await fetch(url, {
+            signal: ac.signal,
+            headers: {
+              'User-Agent': YT_STREAM_UA,
+              Range: 'bytes=0-255',
+            },
+          });
+          if (res.status === 206 || res.status === 200) {
+            available.add(itag);
+            const cr = res.headers.get('content-range') || '';
+            const m = cr.match(/\/(\d+)$/);
+            if (m?.[1]) {
+              ytStreamTotalBytesCache.set(`${videoId}:${itag}`, Number(m[1]));
+            }
+          }
+          await res.body?.cancel().catch(() => {});
+        } catch {
+          // Ignore individual itag probe timeout/error
+        } finally {
+          clearTimeout(timer);
+        }
+      })
+    );
+
+    return available;
+  };
+
+  let found = await probeItagsOnOrigin(activeCompanionOrigin);
+  if (found.size === 0) {
+    const refreshed = await discoverCompanionOrigin(videoId);
+    found = await probeItagsOnOrigin(refreshed);
+  }
+
+  const qualities: YoutubeResolvedQuality[] = [];
+  const hasAudio = found.has(140);
+
+  if (hasAudio && (found.has(299) || found.has(137))) {
+    const is60 = found.has(299);
+    qualities.push({
+      height: 1080,
+      label: is60 ? '1080p60 HD' : '1080p HD',
+      videoItag: is60 ? 299 : 137,
+      audioItag: 140,
+      fps: is60 ? 60 : 30,
+    });
+  }
+
+  if (hasAudio && (found.has(298) || found.has(136))) {
+    const is60 = found.has(298);
+    qualities.push({
+      height: 720,
+      label: is60 ? '720p60 HD' : '720p HD',
+      videoItag: is60 ? 298 : 136,
+      audioItag: 140,
+      fps: is60 ? 60 : 30,
+    });
+  }
+
+  if (hasAudio && found.has(135)) {
+    qualities.push({
+      height: 480,
+      label: '480p',
+      videoItag: 135,
+      audioItag: 140,
+      fps: 30,
+    });
+  }
+
+  qualities.push({
+    height: 360,
+    label: '360p',
+    videoItag: 18,
+    audioItag: null,
+    fps: 30,
+  });
+
+  if (found.size > 0) {
+    ytQualitiesCache.set(videoId, {
+      qualities,
+      expiresAt: Date.now() + 30 * 60_000,
+    });
+  }
+
+  return qualities;
+}
+
+// Per-viewer stateless quality discovery endpoint (never mutates shared broadcast state)
+app.get('/api/yt/qualities/:videoId', async (req, res) => {
+  const videoId = String(req.params.videoId || '').trim();
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+    res.status(400).json({ qualities: [] });
+    return;
+  }
+  try {
+    const qualities = await resolveYoutubeQualities(videoId);
+    res.setHeader('Cache-Control', 'public, max-age=900');
+    res.json({ videoId, qualities });
+  } catch {
+    res.json({
+      videoId,
+      qualities: [
+        { height: 360, label: '360p', videoItag: 18, audioItag: null, fps: 30 },
+      ],
+    });
+  }
+});
+
 app.get('/api/yt/stream/:videoId', async (req, res) => {
   const videoId = String(req.params.videoId || '').trim();
   if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
     res.status(400).send('Invalid YouTube video ID');
     return;
   }
+
+  const rawItag = Number(req.query.itag || 18);
+  const itag = ALLOWED_YT_ITAGS.has(rawItag) ? rawItag : 18;
+  const bytesCacheKey = `${videoId}:${itag}`;
+  const fallbackMime = itag === 140 ? 'audio/mp4' : 'video/mp4';
 
   const abortController = new AbortController();
   res.on('close', () => {
@@ -1890,7 +2034,7 @@ app.get('/api/yt/stream/:videoId', async (req, res) => {
   const buildUpstreamUrl = (origin: string) =>
     `${origin}/companion/latest_version?id=${encodeURIComponent(
       videoId
-    )}&itag=18&local=true`;
+    )}&itag=${itag}&local=true`;
 
   try {
     const rawRange = req.headers.range;
@@ -1904,7 +2048,7 @@ app.get('/api/yt/stream/:videoId', async (req, res) => {
       }
     }
 
-    const knownTotal = ytStreamTotalBytesCache.get(videoId);
+    const knownTotal = ytStreamTotalBytesCache.get(bytesCacheKey);
     const initialMaxEnd =
       knownTotal !== undefined
         ? Math.min(
@@ -1944,7 +2088,7 @@ app.get('/api/yt/stream/:videoId', async (req, res) => {
     const totalMatch = contentRange.match(/\/(\d+)$/);
 
     if (totalMatch?.[1]) {
-      ytStreamTotalBytesCache.set(videoId, Number(totalMatch[1]));
+      ytStreamTotalBytesCache.set(bytesCacheKey, Number(totalMatch[1]));
     } else if (contentRange.endsWith('/*')) {
       // Cold stream without cached clen on bounded range: fetch open-ended to learn exact total size
       await upstream.body?.cancel().catch(() => {});
@@ -1953,12 +2097,12 @@ app.get('/api/yt/stream/:videoId', async (req, res) => {
       const openTotalMatch = contentRange.match(/\/(\d+)$/);
       if (openTotalMatch?.[1]) {
         const total = Number(openTotalMatch[1]);
-        ytStreamTotalBytesCache.set(videoId, total);
+        ytStreamTotalBytesCache.set(bytesCacheKey, total);
         const cappedEnd = Math.min(total - 1, start + YT_CHUNK_BYTES - 1);
         const expectedBytes = cappedEnd - start + 1;
 
         res.status(206);
-        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Type', fallbackMime);
         res.setHeader('Accept-Ranges', 'bytes');
         res.setHeader('Content-Range', `bytes ${start}-${cappedEnd}/${total}`);
         res.setHeader('Content-Length', String(expectedBytes));
@@ -1998,7 +2142,7 @@ app.get('/api/yt/stream/:videoId', async (req, res) => {
     res.status(rawRange && contentRange ? 206 : upstream.status);
     res.setHeader(
       'Content-Type',
-      upstream.headers.get('content-type') || 'video/mp4'
+      upstream.headers.get('content-type') || fallbackMime
     );
     res.setHeader('Accept-Ranges', 'bytes');
     if (contentRange) {
