@@ -1,6 +1,18 @@
 export type BroadcastMode = 'auto' | 'force_twitch' | 'force_youtube';
 export type ActiveSource = 'twitch' | 'youtube';
 
+export type ProgramTheme =
+  | 'entretiens'
+  | 'meetings'
+  | 'conferences'
+  | 'assemblee'
+  | 'international';
+
+export interface VideoChapter {
+  title: string;
+  startSeconds: number;
+}
+
 export interface TwitchStatus {
   isLive: boolean;
   channelLogin: string;
@@ -23,6 +35,8 @@ export interface YouTubeVideoItem {
   sourceType: 'rss' | 'custom';
   twitchVodId?: string;
   twitchChannelLogin?: string;
+  theme: ProgramTheme;
+  chapters: VideoChapter[];
 }
 
 export interface TransitionLog {
@@ -39,9 +53,22 @@ export interface ChatMessage {
   createdAt: string;
 }
 
+export interface KeepAliveStats {
+  enabled: boolean;
+  targetUrl: string | null;
+  intervalSeconds: number;
+  pingCount: number;
+  lastPingAt: string | null;
+  lastPingStatus: 'ok' | 'local' | 'error';
+  uptimeSeconds: number;
+}
+
 export interface BroadcastState {
   mode: BroadcastMode;
   activeSource: ActiveSource;
+  activeThemeFilter: ProgramTheme | 'all';
+  flashBannerTriggeredAt: number;
+  keepAlive: KeepAliveStats;
   twitch: TwitchStatus;
   playlist: YouTubeVideoItem[];
   currentIndex: number;

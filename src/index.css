@@ -9,8 +9,8 @@
 @layer base {
   body {
     font-family: var(--font-sans);
-    background-color: #0b0f19;
-    color: #f1f5f9;
+    background-color: #050505;
+    color: #fafafa;
     letter-spacing: 0.005em;
   }
 
@@ -26,3 +26,119 @@
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
+
+/* Monochrome precision range slider */
+input[type="range"].mono-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 9999px;
+  outline: none;
+}
+
+input[type="range"].mono-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #ffffff;
+  border: 2px solid #000000;
+  cursor: pointer;
+  transition: transform 120ms ease;
+}
+
+input[type="range"].mono-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.18);
+}
+
+input[type="range"].mono-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #ffffff;
+  border: 2px solid #000000;
+  cursor: pointer;
+}
+
+/* Broadcast Corner Vignette Studio Backdrop & Compositor Animations */
+.tv-vignette-backdrop {
+  background-color: #09090b;
+  background-image:
+    linear-gradient(100deg, rgba(6, 6, 8, 0.97) 0%, rgba(10, 10, 14, 0.91) 53%, rgba(28, 30, 38, 0.45) 100%),
+    radial-gradient(circle at 80% 42%, rgba(255, 255, 255, 0.28) 0%, rgba(160, 165, 180, 0.12) 38%, rgba(8, 8, 10, 0.96) 76%),
+    repeating-linear-gradient(-45deg, rgba(255, 255, 255, 0.03) 0px, rgba(255, 255, 255, 0.03) 1px, transparent 1px, transparent 9px);
+}
+
+@keyframes tvCardPopIn {
+  0% {
+    opacity: 0;
+    transform: translate3d(24px, 14px, 0) scale(0.95);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes tvPortraitSlideIn {
+  0% {
+    opacity: 0;
+    transform: translate3d(12px, 16px, 0) scale(0.93);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes tvSheenPass {
+  0% {
+    opacity: 0;
+    transform: translate3d(-130%, 0, 0) skewX(-20deg);
+  }
+  20% {
+    opacity: 0.55;
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(260%, 0, 0) skewX(-20deg);
+  }
+}
+
+@keyframes tvTimerBar {
+  0% {
+    transform: scaleX(1);
+  }
+  100% {
+    transform: scaleX(0);
+  }
+}
+
+.tv-card-animate {
+  animation: tvCardPopIn 380ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.tv-portrait-animate {
+  animation: tvPortraitSlideIn 480ms cubic-bezier(0.16, 1, 0.3, 1) 90ms both;
+}
+
+.tv-sheen-animate {
+  animation: tvSheenPass 1150ms cubic-bezier(0.16, 1, 0.3, 1) 180ms both;
+}
+
+.tv-timer-animate {
+  transform-origin: left center;
+  animation: tvTimerBar 18s linear both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tv-card-animate,
+  .tv-portrait-animate,
+  .tv-sheen-animate,
+  .tv-timer-animate {
+    animation: none !important;
+  }
+}
+

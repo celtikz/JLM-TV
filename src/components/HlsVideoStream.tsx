@@ -30,7 +30,6 @@ export function HlsVideoStream({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
 
-  // Store dynamic props and callbacks in refs so the player instance is NEVER recreated on parent re-renders
   const initialStartRef = useRef<number>(targetStartSeconds);
   const isMutedRef = useRef<boolean>(isMuted);
   const volumeRef = useRef<number>(volume);
@@ -102,7 +101,6 @@ export function HlsVideoStream({
 
     video.addEventListener('canplay', onMediaReady);
 
-    // Direct MP4 Byte-Range Stream (e.g. YouTube /api/yt/stream/:videoId)
     if (isDirectMp4) {
       let mp4Retries = 0;
       let retryTimer: number | null = null;
@@ -173,7 +171,6 @@ export function HlsVideoStream({
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
         if (destroyed) return;
-        // Start on 480p (~1.1 MB segment) for sub-second first frame via proxy, then ABR scales up to HD automatically
         const fastIdx = data.levels.findIndex(
           (lvl) => lvl.height >= 440 && lvl.height <= 540
         );
@@ -197,7 +194,10 @@ export function HlsVideoStream({
           const bufStart = el.buffered.start(0);
           const bufEnd = el.buffered.end(el.buffered.length - 1);
           if (el.currentTime < bufStart - 0.5 || el.currentTime > bufEnd + 1) {
-            el.currentTime = Math.max(bufStart + 0.05, Math.min(bufEnd - 0.1, initialStartRef.current));
+            el.currentTime = Math.max(
+              bufStart + 0.05,
+              Math.min(bufEnd - 0.1, initialStartRef.current)
+            );
           }
         }
         setIsLoading(false);
@@ -252,7 +252,6 @@ export function HlsVideoStream({
     };
   }, [manifestUrl, isLive, reloadKey]);
 
-  // Smoothly seek when targetStartSeconds jumps (e.g. +5 min button or progress bar click)
   useEffect(() => {
     if (isLive) return;
     const el = videoRef.current;
@@ -319,8 +318,8 @@ export function HlsVideoStream({
 
       {isLoading && (
         <div className="absolute inset-0 flex items-center justify-center bg-black pointer-events-none">
-          <div className="px-4 py-2.5 rounded-lg bg-slate-900/90 border border-slate-800 text-xs text-slate-200 font-medium">
-            Chargement du signal TV en cours...
+          <div className="px-5 py-3 rounded-xl bg-neutral-950/95 border border-white/15 text-xs text-neutral-200 font-medium tracking-wide">
+            Synchronisation du signal TV...
           </div>
         </div>
       )}
@@ -329,11 +328,11 @@ export function HlsVideoStream({
         <button
           type="button"
           onClick={handleUnmuteOrPlayClick}
-          className="absolute inset-0 z-20 flex items-center justify-center bg-black/45 cursor-pointer"
+          className="absolute inset-0 z-20 flex items-center justify-center bg-black/55 cursor-pointer"
         >
-          <span className="inline-flex items-center gap-2.5 px-5 py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-sm font-semibold shadow-lg">
+          <span className="inline-flex items-center gap-3 px-6 py-3.5 rounded-xl bg-white hover:bg-neutral-200 text-black text-sm font-semibold shadow-2xl transition-colors">
             <Play className="w-4 h-4 fill-current shrink-0" />
-            <span>Cliquer pour lancer le direct TV</span>
+            <span>Lancer le direct TV</span>
           </span>
         </button>
       )}
@@ -342,10 +341,10 @@ export function HlsVideoStream({
         <button
           type="button"
           onClick={handleUnmuteOrPlayClick}
-          className="absolute bottom-16 right-6 z-20 inline-flex items-center gap-2.5 px-4 py-2.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs sm:text-sm font-semibold shadow-lg transition-transform active:scale-95 cursor-pointer"
+          className="absolute top-6 right-6 z-20 inline-flex items-center gap-2.5 px-4 py-2.5 rounded-xl bg-white hover:bg-neutral-200 text-black text-xs sm:text-sm font-semibold shadow-2xl transition-transform active:scale-95 cursor-pointer"
         >
           <VolumeX className="w-4 h-4 shrink-0" />
-          <span>Cliquer pour activer le son</span>
+          <span>Activer le son</span>
         </button>
       )}
     </div>

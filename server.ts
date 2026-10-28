@@ -12,10 +12,18 @@ import type {
   BroadcastMode,
   BroadcastState,
   ChatMessage,
+  KeepAliveStats,
+  ProgramTheme,
   TransitionLog,
   TwitchStatus,
+  VideoChapter,
   YouTubeVideoItem,
 } from './src/types/broadcast.ts';
+import {
+  classifyProgramTheme,
+  ensureVideoChapters,
+  getThemeDefinition,
+} from './src/utils/programMetadata.ts';
 
 dotenv.config();
 
@@ -23,6 +31,21 @@ const PORT = Number(process.env.PORT) || 3000;
 const TWITCH_LOGIN = 'jlmelenchon';
 const YOUTUBE_CHANNEL_ID = 'UCk-_PEY3iC6DIGJKuoEe9bw';
 const TWITCH_PUBLIC_CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
+
+const SERVER_BOOT_MS = Date.now();
+const KEEPALIVE_INTERVAL_SEC = 240; // 4 minutes (Render sleeps after 15 min idle)
+let detectedExternalOrigin: string | null =
+  (
+    process.env.PUBLIC_APP_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    process.env.APP_URL ||
+    ''
+  )
+    .trim()
+    .replace(/\/+$/, '') || null;
+let keepAlivePingCount = 0;
+let lastKeepAliveAt: string | null = null;
+let lastKeepAliveStatus: 'ok' | 'local' | 'error' = detectedExternalOrigin ? 'ok' : 'local';
 
 function decodeXmlEntities(raw: string): string {
   return raw
@@ -116,8 +139,40 @@ function findMatchingTwitchArchive(youtubeTitle: string): YouTubeVideoItem | nul
 
 const CUSTOM_VIDEOS_FILE = path.join(process.cwd(), 'data', 'custom-videos.json');
 
+function hydrateVideoMetadata(
+  raw: Omit<YouTubeVideoItem, 'theme' | 'chapters'> & {
+    theme?: ProgramTheme;
+    chapters?: VideoChapter[];
+    description?: string;
+  }
+): YouTubeVideoItem {
+  const theme = raw.theme || classifyProgramTheme(raw.title, raw.description || '');
+  const chapters = ensureVideoChapters({
+    id: raw.id,
+    title: raw.title,
+    durationSeconds: raw.durationSeconds,
+    theme,
+    twitchVodId: raw.twitchVodId,
+    rawChapters: raw.chapters,
+    description: raw.description,
+  });
+  return {
+    id: raw.id,
+    title: raw.title,
+    publishedAt: raw.publishedAt,
+    thumbnailUrl: raw.thumbnailUrl,
+    views: raw.views,
+    durationSeconds: raw.durationSeconds,
+    sourceType: raw.sourceType,
+    ...(raw.twitchVodId ? { twitchVodId: raw.twitchVodId } : {}),
+    ...(raw.twitchChannelLogin ? { twitchChannelLogin: raw.twitchChannelLogin } : {}),
+    theme,
+    chapters,
+  };
+}
+
 const DEFAULT_CUSTOM_VIDEOS: YouTubeVideoItem[] = [
-  {
+  hydrateVideoMetadata({
     id: '5qS3PZkpC64',
     title: 'Jean-Luc Mélenchon : discussion sans filtre avec François Lenglet (Présidentielle 2027)',
     publishedAt: '2026-10-25T18:00:00Z',
@@ -125,7 +180,8 @@ const DEFAULT_CUSTOM_VIDEOS: YouTubeVideoItem[] = [
     views: 1200000,
     durationSeconds: 8614,
     sourceType: 'custom',
-  },
+    theme: 'entretiens',
+  }),
 ];
 
 function loadSavedCustomVideos(): YouTubeVideoItem[] {
@@ -133,7 +189,7 @@ function loadSavedCustomVideos(): YouTubeVideoItem[] {
     if (fs.existsSync(CUSTOM_VIDEOS_FILE)) {
       const parsed = JSON.parse(fs.readFileSync(CUSTOM_VIDEOS_FILE, 'utf-8')) as unknown;
       if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed as YouTubeVideoItem[];
+        return (parsed as Array<YouTubeVideoItem>).map((item) => hydrateVideoMetadata(item));
       }
     }
   } catch {
@@ -153,7 +209,7 @@ function saveCustomVideos(playlist: YouTubeVideoItem[]): void {
 }
 
 const FALLBACK_VIDEOS: YouTubeVideoItem[] = [
-  {
+  hydrateVideoMetadata({
     id: 'vod-2906055180',
     twitchVodId: '2906055180',
     title: 'Conférence de Jean-Luc Mélenchon sur le moment politique !',
@@ -162,8 +218,9 @@ const FALLBACK_VIDEOS: YouTubeVideoItem[] = [
     views: 90035,
     durationSeconds: 6257,
     sourceType: 'rss',
-  },
-  {
+    theme: 'conferences',
+  }),
+  hydrateVideoMetadata({
     id: 'vod-2900414335',
     twitchVodId: '2900414335',
     title: 'Conférence de presse de Jean-Luc Mélenchon et Éric Coquerel',
@@ -172,8 +229,9 @@ const FALLBACK_VIDEOS: YouTubeVideoItem[] = [
     views: 40761,
     durationSeconds: 5253,
     sourceType: 'rss',
-  },
-  {
+    theme: 'assemblee',
+  }),
+  hydrateVideoMetadata({
     id: 'vod-2897888840',
     twitchVodId: '2897888840',
     title: 'Meeting de Jean-Luc Mélenchon à Clermont-Ferrand !',
@@ -182,8 +240,9 @@ const FALLBACK_VIDEOS: YouTubeVideoItem[] = [
     views: 62322,
     durationSeconds: 6146,
     sourceType: 'rss',
-  },
-  {
+    theme: 'meetings',
+  }),
+  hydrateVideoMetadata({
     id: 'vod-2892736786',
     twitchVodId: '2892736786',
     title: "Conférence de Jean-Luc Mélenchon à l'invitation de HEC Débats !",
@@ -192,8 +251,9 @@ const FALLBACK_VIDEOS: YouTubeVideoItem[] = [
     views: 67246,
     durationSeconds: 7903,
     sourceType: 'rss',
-  },
-  {
+    theme: 'conferences',
+  }),
+  hydrateVideoMetadata({
     id: 'vod-2889055110',
     twitchVodId: '2889055110',
     title: 'Conférence de Jean-Luc Mélenchon sur le moment politique',
@@ -202,7 +262,8 @@ const FALLBACK_VIDEOS: YouTubeVideoItem[] = [
     views: 11148,
     durationSeconds: 4614,
     sourceType: 'rss',
-  },
+    theme: 'conferences',
+  }),
 ];
 
 const durationCache = new Map<string, number>();
@@ -229,9 +290,24 @@ const initialPlaylist: YouTubeVideoItem[] = [
   ...FALLBACK_VIDEOS,
 ];
 
+function buildKeepAliveStats(): KeepAliveStats {
+  return {
+    enabled: true,
+    targetUrl: detectedExternalOrigin ? `${detectedExternalOrigin}/api/health` : null,
+    intervalSeconds: KEEPALIVE_INTERVAL_SEC,
+    pingCount: keepAlivePingCount,
+    lastPingAt: lastKeepAliveAt,
+    lastPingStatus: lastKeepAliveStatus,
+    uptimeSeconds: Math.max(0, Math.floor((Date.now() - SERVER_BOOT_MS) / 1000)),
+  };
+}
+
 let state: BroadcastState = {
   mode: 'auto',
   activeSource: 'youtube',
+  activeThemeFilter: 'all',
+  flashBannerTriggeredAt: 0,
+  keepAlive: buildKeepAliveStats(),
   twitch: {
     isLive: false,
     channelLogin: TWITCH_LOGIN,
@@ -312,7 +388,12 @@ function rebuildCombinedPlaylist() {
 function advancePlaylist(reason: string, direction: 1 | -1 = 1, _requireHls = false) {
   if (state.playlist.length === 0) return;
 
-  const pool = state.playlist.map((item, idx) => ({ item, idx }));
+  const allPool = state.playlist.map((item, idx) => ({ item, idx }));
+  const themedPool =
+    state.activeThemeFilter === 'all'
+      ? allPool
+      : allPool.filter((p) => p.item.theme === state.activeThemeFilter);
+  const pool = themedPool.length > 0 ? themedPool : allPool;
 
   if (state.shuffleYoutube && pool.length > 1 && direction === 1) {
     const others = pool.filter((p) => p.idx !== state.currentIndex);
@@ -420,16 +501,18 @@ async function probeTwitchChannel(): Promise<TwitchStatus> {
       if (!node?.id || !node?.title || !node?.lengthSeconds || node.lengthSeconds < 480) {
         continue;
       }
-      fetchedArchives.push({
-        id: `vod-${node.id}`,
-        twitchVodId: node.id,
-        title: node.title,
-        publishedAt: node.publishedAt || new Date().toISOString(),
-        thumbnailUrl: node.previewThumbnailURL || '',
-        views: node.viewCount ?? 0,
-        durationSeconds: node.lengthSeconds,
-        sourceType: 'rss',
-      });
+      fetchedArchives.push(
+        hydrateVideoMetadata({
+          id: `vod-${node.id}`,
+          twitchVodId: node.id,
+          title: node.title,
+          publishedAt: node.publishedAt || new Date().toISOString(),
+          thumbnailUrl: node.previewThumbnailURL || '',
+          views: node.viewCount ?? 0,
+          durationSeconds: node.lengthSeconds,
+          sourceType: 'rss',
+        })
+      );
     }
     let archivesChanged = false;
     if (fetchedArchives.length > 0) {
@@ -510,6 +593,7 @@ async function syncYoutubeFeed(): Promise<void> {
       const titleMatch = entry.match(/<title>([^<]+)<\/title>/);
       const pubMatch = entry.match(/<published>([^<]+)<\/published>/);
       const viewsMatch = entry.match(/<media:statistics\s+views="(\d+)"/);
+      const descMatch = entry.match(/<media:description>([\s\S]*?)<\/media:description>/);
 
       if (!idMatch || !titleMatch) continue;
       const id = idMatch[1].trim();
@@ -519,18 +603,22 @@ async function syncYoutubeFeed(): Promise<void> {
       if (views === 0) continue;
 
       const title = decodeXmlEntities(titleMatch[1].trim());
+      const description = descMatch ? decodeXmlEntities(descMatch[1].trim()) : '';
       const publishedAt = pubMatch ? pubMatch[1].trim() : new Date().toISOString();
-      const cachedDuration = durationCache.get(id) ?? 1200;
+      const cachedDuration = durationCache.get(id) ?? 1800;
 
-      parsedItems.push({
-        id,
-        title,
-        publishedAt,
-        thumbnailUrl: `https://i2.ytimg.com/vi/${id}/hqdefault.jpg`,
-        views,
-        durationSeconds: cachedDuration,
-        sourceType: 'rss',
-      });
+      parsedItems.push(
+        hydrateVideoMetadata({
+          id,
+          title,
+          publishedAt,
+          thumbnailUrl: `https://i2.ytimg.com/vi/${id}/hqdefault.jpg`,
+          views,
+          durationSeconds: cachedDuration,
+          sourceType: 'rss',
+          description,
+        })
+      );
     }
 
     if (parsedItems.length > 0) {
@@ -547,11 +635,13 @@ async function fetchYoutubeVideoDetails(videoId: string): Promise<{
   title: string;
   durationSeconds: number;
   views: number;
+  rawChapters: VideoChapter[];
+  description: string;
 }> {
   const browserUa =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
 
-  // 1. Fast Piped metadata API (~200ms, returns exact durationSeconds + views + title)
+  // 1. Fast Piped metadata API (~200ms, returns exact durationSeconds + views + title + chapters)
   try {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 3800);
@@ -565,13 +655,32 @@ async function fetchYoutubeVideoDetails(videoId: string): Promise<{
         title?: string;
         duration?: number;
         views?: number;
+        description?: string;
+        chapters?: Array<{ title?: string; start?: number }>;
       };
       if (data.title && data.duration && data.duration > 0) {
-        durationCache.set(videoId, Math.round(data.duration));
+        const dur = Math.round(data.duration);
+        durationCache.set(videoId, dur);
+        const rawChapters: VideoChapter[] = Array.isArray(data.chapters)
+          ? data.chapters
+              .filter(
+                (c): c is { title: string; start: number } =>
+                  typeof c?.title === 'string' &&
+                  c.title.trim().length > 0 &&
+                  typeof c?.start === 'number' &&
+                  c.start >= 0
+              )
+              .map((c) => ({
+                title: c.title.trim(),
+                startSeconds: Math.round(c.start),
+              }))
+          : [];
         return {
           title: data.title.trim(),
-          durationSeconds: Math.round(data.duration),
+          durationSeconds: dur,
           views: data.views ?? 0,
+          rawChapters,
+          description: typeof data.description === 'string' ? data.description : '',
         };
       }
     }
@@ -630,6 +739,8 @@ async function fetchYoutubeVideoDetails(videoId: string): Promise<{
     title: fallbackTitle || `Vidéo YouTube (${videoId})`,
     durationSeconds: fallbackDuration,
     views: 0,
+    rawChapters: [],
+    description: '',
   };
 }
 
@@ -744,6 +855,20 @@ async function fetchTwitchPlaybackToken(
 
 const app = express();
 app.use((req, _res, next) => {
+  if (!detectedExternalOrigin) {
+    const rawHost = String(req.headers['x-forwarded-host'] || req.headers.host || '')
+      .split(',')[0]
+      .trim();
+    if (
+      rawHost &&
+      !rawHost.startsWith('localhost') &&
+      !rawHost.startsWith('127.0.0.1') &&
+      !rawHost.startsWith('0.0.0.0')
+    ) {
+      detectedExternalOrigin = `https://${rawHost}`;
+    }
+  }
+
   if (req.url.startsWith('/.proxy/')) {
     req.url = req.url.slice('/.proxy'.length);
   } else if (req.url === '/.proxy') {
@@ -752,6 +877,27 @@ app.use((req, _res, next) => {
   next();
 });
 app.use(express.json());
+
+// Anti-Sleep Health & Keep-Alive Endpoint (Render Free Tier H24 Watchdog + GitHub Actions)
+app.get(['/api/health', '/api/keepalive'], (req, res) => {
+  const source = String(req.query.source || '').trim();
+  if (source) {
+    keepAlivePingCount += 1;
+    lastKeepAliveAt = new Date().toISOString();
+    lastKeepAliveStatus = 'ok';
+  }
+  const currentVideo = state.playlist[state.currentIndex] || null;
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(200).json({
+    ok: true,
+    status: 'awake',
+    serverTime: Date.now(),
+    uptimeSeconds: Math.max(0, Math.floor((Date.now() - SERVER_BOOT_MS) / 1000)),
+    activeSource: state.activeSource,
+    currentProgram: currentVideo?.title || null,
+    keepAlive: buildKeepAliveStats(),
+  });
+});
 
 // HLS Live Stream Endpoint (Default JLM Channel)
 app.get('/api/hls/live.m3u8', async (_req, res) => {
@@ -1188,6 +1334,107 @@ app.get('/api/yt/stream/:videoId', async (req, res) => {
   }
 });
 
+// ============================================================================
+// CSP-Compliant Thumbnail Proxy (/api/tv/thumb) for Web & Discord Activity
+// ============================================================================
+
+const thumbMemoryCache = new Map<
+  string,
+  { buffer: Buffer; contentType: string; expiresAt: number }
+>();
+
+function isAllowedThumbHost(rawUrl: string): boolean {
+  try {
+    const u = new URL(rawUrl);
+    if (u.protocol !== 'https:') return false;
+    const h = u.hostname.toLowerCase();
+    return (
+      h === 'i.ytimg.com' ||
+      h === 'i1.ytimg.com' ||
+      h === 'i2.ytimg.com' ||
+      h === 'i3.ytimg.com' ||
+      h === 'i4.ytimg.com' ||
+      h === 'img.youtube.com' ||
+      h === 'yt3.ggpht.com' ||
+      h === 'static-cdn.jtvnw.net' ||
+      h.endsWith('.jtvnw.net') ||
+      h.endsWith('.twitch.tv') ||
+      h.endsWith('.ytimg.com')
+    );
+  } catch {
+    return false;
+  }
+}
+
+app.get('/api/tv/thumb', async (req, res) => {
+  const ytId = String(req.query.yt || '').trim();
+  const rawUrl = String(req.query.u || '').trim();
+
+  const candidateUrls: string[] = [];
+  if (/^[a-zA-Z0-9_-]{11}$/.test(ytId)) {
+    candidateUrls.push(
+      `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg`,
+      `https://i.ytimg.com/vi/${ytId}/mqdefault.jpg`
+    );
+  } else if (rawUrl && isAllowedThumbHost(rawUrl)) {
+    candidateUrls.push(rawUrl);
+    const ytMatch = rawUrl.match(/\/vi\/([a-zA-Z0-9_-]{11})\//);
+    if (ytMatch?.[1]) {
+      candidateUrls.push(`https://i.ytimg.com/vi/${ytMatch[1]}/mqdefault.jpg`);
+    }
+  } else {
+    res.status(400).send('Invalid thumbnail query');
+    return;
+  }
+
+  const cacheKey = candidateUrls[0];
+  const cached = thumbMemoryCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    res.setHeader('Content-Type', cached.contentType);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(cached.buffer);
+    return;
+  }
+
+  for (const target of candidateUrls) {
+    try {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 5000);
+      const upstream = await fetch(target, {
+        signal: ac.signal,
+        headers: { 'User-Agent': YT_STREAM_UA },
+      });
+      clearTimeout(timer);
+      if (!upstream.ok) continue;
+
+      const contentType = upstream.headers.get('content-type') || 'image/jpeg';
+      const arrBuf = await upstream.arrayBuffer();
+      const buffer = Buffer.from(arrBuf);
+      if (buffer.byteLength < 200) continue;
+
+      if (thumbMemoryCache.size >= 120) {
+        const oldestKey = thumbMemoryCache.keys().next().value;
+        if (oldestKey) thumbMemoryCache.delete(oldestKey);
+      }
+      thumbMemoryCache.set(cacheKey, {
+        buffer,
+        contentType,
+        expiresAt: Date.now() + 30 * 60_000,
+      });
+
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.send(buffer);
+      return;
+    } catch {
+      // Try next fallback candidate
+    }
+  }
+
+  res.status(404).end();
+});
+
+
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
@@ -1203,6 +1450,7 @@ httpServer.on('upgrade', (request, socket, head) => {
 function getPublicState(): BroadcastState {
   return {
     ...state,
+    keepAlive: buildKeepAliveStats(),
     serverTime: Date.now(),
     connectedViewers: wss.clients.size,
   };
@@ -1295,12 +1543,20 @@ wss.on('connection', (socket) => {
 
         case 'playlist:select': {
           const videoId = String(msg.payload?.videoId || '');
+          const requestedStart =
+            typeof msg.payload?.startSeconds === 'number' &&
+            Number.isFinite(msg.payload.startSeconds)
+              ? Math.max(0, Math.round(msg.payload.startSeconds))
+              : null;
           const idx = state.playlist.findIndex((v) => v.id === videoId);
           if (idx >= 0) {
             state.currentIndex = idx;
-            state.currentVideoStartedAt =
-              Date.now() - getProgramEntryOffsetSeconds(state.playlist[idx]) * 1000;
-            if (state.mode === 'auto' && state.twitch.isLive) {
+            const offsetSec =
+              requestedStart !== null
+                ? requestedStart
+                : getProgramEntryOffsetSeconds(state.playlist[idx]);
+            state.currentVideoStartedAt = Date.now() - offsetSec * 1000;
+            if (state.activeSource === 'twitch') {
               state.mode = 'force_youtube';
               state.activeSource = 'youtube';
             }
@@ -1308,6 +1564,27 @@ wss.on('connection', (socket) => {
               `Sélection directe : ${state.playlist[idx].title}`,
               state.activeSource
             );
+            broadcastFullState();
+          }
+          break;
+        }
+
+        case 'playlist:play_next': {
+          const videoId = String(msg.payload?.videoId || '');
+          const fromIdx = state.playlist.findIndex((v) => v.id === videoId);
+          if (fromIdx >= 0 && fromIdx !== state.currentIndex && state.playlist.length > 1) {
+            const currentId = state.playlist[state.currentIndex]?.id;
+            const [movedItem] = state.playlist.splice(fromIdx, 1);
+            const updatedCurrentIdx = currentId
+              ? Math.max(
+                  0,
+                  state.playlist.findIndex((v) => v.id === currentId)
+                )
+              : 0;
+            const insertIdx = Math.min(state.playlist.length, updatedCurrentIdx + 1);
+            state.playlist.splice(insertIdx, 0, movedItem);
+            state.currentIndex = updatedCurrentIdx;
+            appendTransition(`Programmé à suivre : ${movedItem.title}`, state.activeSource);
             broadcastFullState();
           }
           break;
@@ -1329,6 +1606,50 @@ wss.on('connection', (socket) => {
 
         case 'playlist:shuffle': {
           state.shuffleYoutube = Boolean(msg.payload?.shuffle);
+          broadcastFullState();
+          break;
+        }
+
+        case 'theme:set': {
+          const rawTheme = String(msg.payload?.theme || 'all');
+          const allowedThemes: Array<ProgramTheme | 'all'> = [
+            'all',
+            'entretiens',
+            'meetings',
+            'conferences',
+            'assemblee',
+            'international',
+          ];
+          if (allowedThemes.includes(rawTheme as ProgramTheme | 'all')) {
+            const nextTheme = rawTheme as ProgramTheme | 'all';
+            state.activeThemeFilter = nextTheme;
+            if (nextTheme !== 'all') {
+              const current = state.playlist[state.currentIndex];
+              if (!current || current.theme !== nextTheme) {
+                const matchIdx = state.playlist.findIndex((v) => v.theme === nextTheme);
+                if (matchIdx >= 0) {
+                  state.currentIndex = matchIdx;
+                  state.currentVideoStartedAt =
+                    Date.now() - getProgramEntryOffsetSeconds(state.playlist[matchIdx]) * 1000;
+                }
+              }
+              appendTransition(
+                `Programmation thématique activée : ${getThemeDefinition(nextTheme).label}`,
+                state.activeSource
+              );
+            } else {
+              appendTransition(
+                'Programmation H24 ouverte à toutes les thématiques',
+                state.activeSource
+              );
+            }
+            broadcastFullState();
+          }
+          break;
+        }
+
+        case 'banner:flash': {
+          state.flashBannerTriggeredAt = Date.now();
           broadcastFullState();
           break;
         }
@@ -1369,6 +1690,14 @@ wss.on('connection', (socket) => {
             const item = state.playlist.find((v) => v.id === videoId);
             if (item && Math.abs(item.durationSeconds - durationSeconds) > 2) {
               item.durationSeconds = durationSeconds;
+              item.chapters = ensureVideoChapters({
+                id: item.id,
+                title: item.title,
+                durationSeconds,
+                theme: item.theme,
+                twitchVodId: item.twitchVodId,
+                rawChapters: item.chapters,
+              });
               broadcastFullState();
             }
           }
@@ -1528,7 +1857,7 @@ async function addMediaItemToPlaylist(
       // Fallback defaults
     }
 
-    const newItem: YouTubeVideoItem = {
+    const newItem: YouTubeVideoItem = hydrateVideoMetadata({
       id: itemId,
       twitchVodId: vodId,
       title,
@@ -1537,7 +1866,7 @@ async function addMediaItemToPlaylist(
       views,
       durationSeconds,
       sourceType: 'custom',
-    };
+    });
 
     const existingIdx = state.playlist.findIndex((v) => v.id === itemId);
     if (existingIdx === -1) {
@@ -1642,7 +1971,7 @@ async function addMediaItemToPlaylist(
       if (u.stream && u.stream.type === 'live') {
         const itemId = `channel-${login}`;
         const liveTitle = `DIRECT · ${u.displayName || login} — ${u.stream.title || 'En direct'}`;
-        const newItem: YouTubeVideoItem = {
+        const newItem: YouTubeVideoItem = hydrateVideoMetadata({
           id: itemId,
           twitchChannelLogin: login,
           title: liveTitle,
@@ -1651,7 +1980,7 @@ async function addMediaItemToPlaylist(
           views: 0,
           durationSeconds: 43200,
           sourceType: 'custom',
-        };
+        });
         const existingIdx = state.playlist.findIndex((v) => v.id === itemId);
         if (existingIdx === -1) {
           state.playlist = [newItem, ...state.playlist];
@@ -1711,7 +2040,7 @@ async function addMediaItemToPlaylist(
   const details = await fetchYoutubeVideoDetails(videoId);
 
   const existingIdx = state.playlist.findIndex((v) => v.id === videoId);
-  const newItem: YouTubeVideoItem = {
+  const newItem: YouTubeVideoItem = hydrateVideoMetadata({
     id: videoId,
     title: details.title,
     publishedAt: new Date().toISOString(),
@@ -1719,7 +2048,9 @@ async function addMediaItemToPlaylist(
     views: details.views,
     durationSeconds: details.durationSeconds,
     sourceType: 'custom',
-  };
+    chapters: details.rawChapters,
+    description: details.description,
+  });
 
   if (existingIdx === -1) {
     state.playlist = [newItem, ...state.playlist];
@@ -1729,12 +2060,17 @@ async function addMediaItemToPlaylist(
       state.currentIndex += 1;
     }
   } else {
-    state.playlist[existingIdx] = {
+    state.playlist[existingIdx] = hydrateVideoMetadata({
       ...state.playlist[existingIdx],
       title: details.title || state.playlist[existingIdx].title,
       durationSeconds:
         details.durationSeconds || state.playlist[existingIdx].durationSeconds,
-    };
+      chapters:
+        details.rawChapters.length > 0
+          ? details.rawChapters
+          : state.playlist[existingIdx].chapters,
+      description: details.description,
+    });
     if (playImmediately) {
       state.currentIndex = existingIdx;
     }
@@ -1793,6 +2129,7 @@ app.get('/api/tv/youtube-search', async (req, res) => {
       items?: Array<{
         url?: string;
         title?: string;
+        thumbnail?: string;
         uploaderName?: string;
         duration?: number;
         views?: number;
@@ -1805,13 +2142,14 @@ app.get('/api/tv/youtube-search', async (req, res) => {
         return {
           videoId: vid,
           title: item.title,
+          thumbnailUrl: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
           channelName: item.uploaderName || 'YouTube',
           durationSeconds: Math.round(item.duration),
           views: item.views ?? 0,
         };
       })
       .filter((x): x is NonNullable<typeof x> => Boolean(x))
-      .slice(0, 8);
+      .slice(0, 12);
     res.json({ results });
   } catch {
     res.json({ results: [] });
@@ -1830,6 +2168,39 @@ app.post('/api/tv/playlist/add', async (req, res) => {
 
 app.post('/api/tv/probe', async (_req, res) => {
   await Promise.all([probeTwitchChannel(), syncYoutubeFeed()]);
+  res.json(getPublicState());
+});
+
+async function runKeepAliveWatchdog(): Promise<void> {
+  const targetOrigin = detectedExternalOrigin || `http://127.0.0.1:${PORT}`;
+  const isExternal = Boolean(detectedExternalOrigin);
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 12_000);
+    const res = await fetch(`${targetOrigin}/api/health?source=render-watchdog`, {
+      signal: ac.signal,
+      headers: {
+        'User-Agent': 'JLMTelevision-RenderKeepAlive/1.0',
+        Accept: 'application/json',
+      },
+    });
+    clearTimeout(timer);
+    if (res.ok) {
+      lastKeepAliveAt = new Date().toISOString();
+      lastKeepAliveStatus = isExternal ? 'ok' : 'local';
+      if (!isExternal) {
+        keepAlivePingCount += 1;
+      }
+    } else {
+      lastKeepAliveStatus = 'error';
+    }
+  } catch {
+    lastKeepAliveStatus = 'error';
+  }
+}
+
+app.post('/api/tv/keepalive/ping', async (_req, res) => {
+  await runKeepAliveWatchdog();
   res.json(getPublicState());
 });
 
@@ -1865,6 +2236,11 @@ setInterval(() => {
   void syncYoutubeFeed();
 }, 600_000);
 
+// Render H24 Anti-Sleep Watchdog (pings external URL every 4 minutes < 15m idle sleep threshold)
+setInterval(() => {
+  void runKeepAliveWatchdog();
+}, KEEPALIVE_INTERVAL_SEC * 1000);
+
 setInterval(() => {
   if (state.activeSource === 'youtube' && state.playlist.length > 0) {
     const current = state.playlist[state.currentIndex];
@@ -1881,6 +2257,9 @@ setInterval(() => {
 
 async function bootstrap() {
   void Promise.all([probeTwitchChannel(), syncYoutubeFeed()]);
+  setTimeout(() => {
+    void runKeepAliveWatchdog();
+  }, 8_000);
 
   const isProd =
     process.env.NODE_ENV === 'production' || process.env.npm_lifecycle_event === 'start';
