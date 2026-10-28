@@ -256,7 +256,7 @@ export function HlsVideoStream({
     if (isLive) return;
     const el = videoRef.current;
     if (!el || el.readyState < 1) return;
-    if (Math.abs(el.currentTime - targetStartSeconds) > 12) {
+    if (Math.abs(el.currentTime - targetStartSeconds) > 3) {
       el.currentTime = Math.max(0, targetStartSeconds);
       if (el.paused) {
         void el.play().catch(() => {});

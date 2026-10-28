@@ -14,6 +14,7 @@ import {
   ChevronDown,
   ChevronUp,
   X,
+  BookOpen,
 } from 'lucide-react';
 import type {
   BotConfigOptions,
@@ -27,6 +28,7 @@ import { DiscordTvFullScreen } from './components/DiscordTvFullScreen';
 import { BotBuilderView } from './components/BotBuilderView';
 import { DeploymentGuideView } from './components/DeploymentGuideView';
 import { ProgramThumbnail } from './components/ProgramThumbnail';
+import { TopicExplorerView } from './components/TopicExplorerView';
 import { generateDiscordBotFiles } from './utils/botGenerator';
 import { isRunningInDiscordProxy, useDiscordActivity } from './hooks/useDiscordActivity';
 import {
@@ -34,8 +36,14 @@ import {
   formatTimecode,
   getThemeDefinition,
 } from './utils/programMetadata';
+import {
+  DOCUMENTARY_TOPICS,
+  buildTopicSegments,
+  getTopicSegmentCounts,
+  type DocumentaryTopicId,
+} from './utils/topicExplorer';
 
-type NavTab = 'regie' | 'grille' | 'bot' | 'deploy';
+type NavTab = 'regie' | 'sujets' | 'grille' | 'bot' | 'deploy';
 
 interface CatalogYoutubeSearchItem {
   videoId: string;
@@ -80,6 +88,13 @@ export default function App() {
   const [clockOffsetMs, setClockOffsetMs] = useState<number>(0);
   const [isProbing, setIsProbing] = useState<boolean>(false);
   const [isPingingKeepAlive, setIsPingingKeepAlive] = useState<boolean>(false);
+  const [leftBannersEnabled, setLeftBannersEnabled] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem('jlmtv_left_banners_enabled') !== 'false';
+    } catch {
+      return true;
+    }
+  });
 
   // Non-interrupting local browsing & search states for Programmes
   const [sidebarThemeFilter, setSidebarThemeFilter] = useState<ProgramTheme | 'all'>('all');
@@ -87,6 +102,8 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [sourceFilter, setSourceFilter] = useState<'all' | 'rss' | 'custom'>('all');
   const [catalogThemeFilter, setCatalogThemeFilter] = useState<ProgramTheme | 'all'>('all');
+  const [selectedTopicId, setSelectedTopicId] = useState<DocumentaryTopicId | 'all'>('all');
+  const [isRefreshingChapters, setIsRefreshingChapters] = useState<boolean>(false);
   const [expandedCatalogVideoId, setExpandedCatalogVideoId] = useState<string | null>(null);
   const [queuedFeedbackId, setQueuedFeedbackId] = useState<string | null>(null);
 
@@ -252,6 +269,18 @@ export default function App() {
     [sendWsAction]
   );
 
+  const handleToggleLeftBanners = useCallback((nextValue?: boolean) => {
+    setLeftBannersEnabled((prev) => {
+      const resolved = typeof nextValue === 'boolean' ? nextValue : !prev;
+      try {
+        window.localStorage.setItem('jlmtv_left_banners_enabled', String(resolved));
+      } catch {
+        // Ignore storage errors in restricted iframe contexts
+      }
+      return resolved;
+    });
+  }, []);
+
   const handleManualProbe = async () => {
     setIsProbing(true);
     const apiBase = isRunningInDiscordProxy() ? '/.proxy' : '';
@@ -279,6 +308,21 @@ export default function App() {
       }
     } finally {
       setIsPingingKeepAlive(false);
+    }
+  };
+
+  const handleRefreshChapters = async () => {
+    setIsRefreshingChapters(true);
+    const apiBase = isRunningInDiscordProxy() ? '/.proxy' : '';
+    try {
+      const res = await fetch(`${apiBase}/api/tv/chapters/refresh`, { method: 'POST' });
+      if (res.ok) {
+        const updated = (await res.json()) as BroadcastState;
+        setBroadcast(updated);
+        setClockOffsetMs(updated.serverTime - Date.now());
+      }
+    } finally {
+      setIsRefreshingChapters(false);
     }
   };
 
@@ -404,6 +448,27 @@ export default function App() {
     return broadcast.playlist[nextIdx]?.id || null;
   }, [broadcast]);
 
+  const handlePlaySegment = useCallback(
+    (videoId: string, startSeconds: number) => {
+      if (currentVideo?.id === videoId && broadcast?.activeSource === 'youtube') {
+        sendWsAction('video:seek', { seconds: startSeconds });
+      } else {
+        handleSelectVideo(videoId, startSeconds);
+      }
+    },
+    [currentVideo?.id, broadcast?.activeSource, sendWsAction, handleSelectVideo]
+  );
+
+  const topicSegments = useMemo(
+    () => (broadcast ? buildTopicSegments(broadcast.playlist) : []),
+    [broadcast]
+  );
+
+  const topicCounts = useMemo(
+    () => getTopicSegmentCounts(topicSegments),
+    [topicSegments]
+  );
+
   // Non-interrupting local sidebar browse list
   const sidebarPreviewList = useMemo(() => {
     if (!broadcast) return [];
@@ -447,6 +512,8 @@ export default function App() {
         onSetMode={handleSetMode}
         onSetThemeFilter={handleSetThemeFilter}
         onTriggerFlashBanner={() => sendWsAction('banner:flash')}
+        leftBannersEnabled={leftBannersEnabled}
+        onToggleLeftBanners={handleToggleLeftBanners}
         onPrev={() => sendWsAction('playlist:prev', { requireHls: false })}
         onNext={() => sendWsAction('playlist:next', { requireHls: false })}
         onSeekSeconds={(seconds) => sendWsAction('video:seek', { seconds })}
@@ -463,9 +530,10 @@ export default function App() {
 
   const navItems = [
     { id: 'regie', label: 'Régie & Direct' },
-    { id: 'grille', label: 'Programmes & Grille' },
-    { id: 'bot', label: 'Bot Vocal Go Live' },
-    { id: 'deploy', label: 'Déploiement & Anti-Veille' },
+    { id: 'sujets', label: 'Sujets & Timecodes' },
+    { id: 'grille', label: 'Programmes' },
+    { id: 'bot', label: 'Bot Discord' },
+    { id: 'deploy', label: 'Déploiement' },
   ] as const;
 
   return (
@@ -681,6 +749,10 @@ export default function App() {
                   currentIndex={broadcast.currentIndex}
                   activeThemeFilter={broadcast.activeThemeFilter}
                   flashBannerTriggeredAt={broadcast.flashBannerTriggeredAt}
+                  leftBannerTriggeredAt={broadcast.leftBannerTriggeredAt}
+                  leftBannerManualIndex={broadcast.leftBannerManualIndex}
+                  leftBannersEnabled={leftBannersEnabled}
+                  onToggleLeftBanners={handleToggleLeftBanners}
                   currentVideo={currentVideo}
                   currentVideoStartedAt={broadcast.currentVideoStartedAt}
                   clockOffsetMs={clockOffsetMs}
@@ -690,6 +762,7 @@ export default function App() {
                   onNextVideo={() => sendWsAction('playlist:next')}
                   onSeekSeconds={(seconds) => sendWsAction('video:seek', { seconds })}
                   onTriggerFlashBanner={() => sendWsAction('banner:flash')}
+                  onTriggerLeftBanner={() => sendWsAction('banner:left')}
                   onSwitchToYoutube={() => handleSetMode('force_youtube')}
                   onEnterFullScreenTv={() => setTvOnlyMode(true)}
                   onReportDuration={handleReportDuration}
@@ -698,60 +771,106 @@ export default function App() {
                 />
 
                 {activeTab === 'regie' && (
-                  <div className="border border-white/15 bg-neutral-950 rounded-2xl p-6 space-y-3.5">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <h3 className="text-sm font-semibold text-white">
-                        Lancer ou programmer une vidéo (YouTube ou Twitch)
-                      </h3>
-                      <span className="text-xs text-neutral-400">
-                        Compatible Web & Activité vocale Discord
-                      </span>
-                    </div>
-                    <div className="flex flex-col sm:flex-row gap-3">
-                      <input
-                        type="text"
-                        value={customYoutubeUrl}
-                        onChange={(e) => setCustomYoutubeUrl(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            e.preventDefault();
-                            void handleAddYoutubeVideo(true);
-                          }
-                        }}
-                        placeholder="Coller un lien YouTube (watch?v=..., youtu.be/...) ou Twitch..."
-                        className="flex-1 px-4 py-2.5 text-sm bg-black border border-neutral-800 rounded-xl text-white placeholder:text-neutral-500 focus:outline-none focus:border-white"
-                      />
-                      <div className="flex items-center gap-2.5 shrink-0">
+                  <>
+                    {/* Quick Documentary Subject Shortcuts (Opens Sujets & Timecodes without interrupting live TV) */}
+                    <div className="border border-white/15 bg-neutral-950 rounded-2xl p-6 space-y-3.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="space-y-0.5">
+                          <h3 className="text-sm font-semibold text-white inline-flex items-center gap-2">
+                            <BookOpen className="w-4 h-4 shrink-0" />
+                            <span>S’informer sur un sujet précis (accès direct au bon timecode)</span>
+                          </h3>
+                          <p className="text-xs text-neutral-400">
+                            Cliquez sur un sujet pour voir toutes les conférences, entretiens et vlogs correspondants sans couper le direct.
+                          </p>
+                        </div>
                         <button
                           type="button"
-                          disabled={isAddingMedia}
-                          onClick={() => void handleAddYoutubeVideo(true)}
-                          className="inline-flex items-center gap-2 px-5 py-2.5 text-xs font-semibold text-black bg-white hover:bg-neutral-200 rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                          onClick={() => {
+                            setSelectedTopicId('all');
+                            setActiveTab('sujets');
+                          }}
+                          className="text-xs font-semibold text-white hover:underline cursor-pointer whitespace-nowrap"
                         >
-                          <Play className="w-3.5 h-3.5 fill-current shrink-0" />
-                          <span>{isAddingMedia ? 'Envoi...' : 'Diffuser maintenant'}</span>
-                        </button>
-                        <button
-                          type="button"
-                          disabled={isAddingMedia}
-                          onClick={() => void handleAddYoutubeVideo(false)}
-                          className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-medium text-neutral-200 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
-                        >
-                          <Plus className="w-3.5 h-3.5 shrink-0" />
-                          <span>Ajouter à la file</span>
+                          Voir les {topicSegments.length} séquences chapitrées
                         </button>
                       </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        {DOCUMENTARY_TOPICS.map((topic) => (
+                          <button
+                            key={topic.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedTopicId(topic.id);
+                              setActiveTab('sujets');
+                            }}
+                            className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-neutral-200 hover:text-black bg-black hover:bg-white border border-neutral-800 hover:border-white rounded-xl transition-colors cursor-pointer whitespace-nowrap"
+                          >
+                            <span>{topic.shortLabel}</span>
+                            <span className="font-mono tabular-nums text-[11px] opacity-70">
+                              {topicCounts[topic.id] || 0}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                    {addStatusMsg && (
-                      <p
-                        className={`text-xs leading-relaxed ${
-                          addStatusTone === 'err' ? 'text-neutral-300' : 'text-white font-medium'
-                        }`}
-                      >
-                        {addStatusMsg}
-                      </p>
-                    )}
-                  </div>
+
+                    <div className="border border-white/15 bg-neutral-950 rounded-2xl p-6 space-y-3.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h3 className="text-sm font-semibold text-white">
+                          Lancer ou programmer une vidéo / playlist (YouTube ou Twitch)
+                        </h3>
+                        <span className="text-xs text-neutral-400">
+                          Shorts automatiquement exclus · Compatible Web & Discord
+                        </span>
+                      </div>
+                      <div className="flex flex-col sm:flex-row gap-3">
+                        <input
+                          type="text"
+                          value={customYoutubeUrl}
+                          onChange={(e) => setCustomYoutubeUrl(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              void handleAddYoutubeVideo(true);
+                            }
+                          }}
+                          placeholder="Coller un lien vidéo ou playlist YouTube (watch?v=..., playlist?list=...) ou Twitch..."
+                          className="flex-1 px-4 py-2.5 text-sm bg-black border border-neutral-800 rounded-xl text-white placeholder:text-neutral-500 focus:outline-none focus:border-white"
+                        />
+                        <div className="flex items-center gap-2.5 shrink-0">
+                          <button
+                            type="button"
+                            disabled={isAddingMedia}
+                            onClick={() => void handleAddYoutubeVideo(true)}
+                            className="inline-flex items-center gap-2 px-5 py-2.5 text-xs font-semibold text-black bg-white hover:bg-neutral-200 rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                          >
+                            <Play className="w-3.5 h-3.5 fill-current shrink-0" />
+                            <span>{isAddingMedia ? 'Envoi...' : 'Diffuser maintenant'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isAddingMedia}
+                            onClick={() => void handleAddYoutubeVideo(false)}
+                            className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-medium text-neutral-200 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                          >
+                            <Plus className="w-3.5 h-3.5 shrink-0" />
+                            <span>Ajouter à la file</span>
+                          </button>
+                        </div>
+                      </div>
+                      {addStatusMsg && (
+                        <p
+                          className={`text-xs leading-relaxed ${
+                            addStatusTone === 'err' ? 'text-neutral-300' : 'text-white font-medium'
+                          }`}
+                        >
+                          {addStatusMsg}
+                        </p>
+                      )}
+                    </div>
+                  </>
                 )}
               </div>
 
@@ -1024,6 +1143,23 @@ export default function App() {
                   ))}
                 </div>
               </section>
+            )}
+
+            {/* Documentary Subject & Timecode Explorer ("Sujets & Timecodes") — Live Broadcast Continues in Mini-Player! */}
+            {activeTab === 'sujets' && (
+              <TopicExplorerView
+                playlist={broadcast.playlist}
+                currentVideoId={currentVideo?.id || null}
+                isPlayingYoutube={broadcast.activeSource === 'youtube'}
+                nextQueuedVideoId={nextQueuedVideoId}
+                queuedFeedbackId={queuedFeedbackId}
+                selectedTopic={selectedTopicId}
+                onSelectTopic={setSelectedTopicId}
+                isRefreshingChapters={isRefreshingChapters}
+                onRefreshChapters={() => void handleRefreshChapters()}
+                onPlaySegment={handlePlaySegment}
+                onQueueNext={handleQueueNext}
+              />
             )}
 
             {/* Full YouTube-Style Video Feed ("Programmes & Grille") — Live Broadcast Continues in Mini-Player! */}

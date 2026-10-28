@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type MouseEvent } from 'react';
 import { DiscordSDK, patchUrlMappings } from '@discord/embedded-app-sdk';
 
 export interface DiscordActivityStatus {
@@ -8,12 +8,31 @@ export interface DiscordActivityStatus {
   guildId: string | null;
 }
 
+let activeDiscordSdk: DiscordSDK | null = null;
+
 export function isRunningInDiscordProxy(): boolean {
   if (typeof window === 'undefined') return false;
   return (
     window.location.hostname.endsWith('.discordsays.com') ||
     window.location.hostname.endsWith('.discord.media')
   );
+}
+
+/**
+ * Opens an external URL cleanly in both Web browsers (via native <a target="_blank">)
+ * and Discord Voice Activities (via DiscordSDK openExternalLink command).
+ */
+export function handleDiscordAwareLinkClick(
+  e: MouseEvent<HTMLAnchorElement>,
+  url: string
+): void {
+  e.stopPropagation();
+  if (activeDiscordSdk) {
+    e.preventDefault();
+    void activeDiscordSdk.commands.openExternalLink({ url }).catch(() => {
+      // Fallback handled by Discord client modal
+    });
+  }
 }
 
 export function useDiscordActivity(): DiscordActivityStatus {
@@ -55,6 +74,7 @@ export function useDiscordActivity(): DiscordActivityStatus {
         await sdk.ready();
 
         if (!cancelled) {
+          activeDiscordSdk = sdk;
           setStatus({
             isEmbeddedInDiscord: true,
             ready: true,

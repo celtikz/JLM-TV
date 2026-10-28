@@ -7,6 +7,7 @@ interface ChapterTimelineProps {
   positionSeconds: number;
   chapters: VideoChapter[];
   onSeekSeconds: (seconds: number) => void;
+  compact?: boolean;
 }
 
 export function ChapterTimeline({
@@ -14,6 +15,7 @@ export function ChapterTimeline({
   positionSeconds,
   chapters,
   onSeekSeconds,
+  compact = false,
 }: ChapterTimelineProps) {
   const barRef = useRef<HTMLDivElement | null>(null);
   const [hoverSec, setHoverSec] = useState<number | null>(null);
@@ -53,7 +55,7 @@ export function ChapterTimeline({
         const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
         onSeekSeconds(Math.round(ratio * durationSeconds));
       }}
-      className="relative group py-3 cursor-pointer select-none"
+      className={`relative group cursor-pointer select-none ${compact ? 'py-1.5' : 'py-3'}`}
       title="Cliquer pour naviguer dans les chapitres du programme"
     >
       {/* Floating Monochrome Hover Preview Bar */}
@@ -79,7 +81,9 @@ export function ChapterTimeline({
       <svg
         viewBox={`0 0 ${VIEWBOX_WIDTH} 12`}
         preserveAspectRatio="none"
-        className="block w-full h-2 group-hover:h-3 transition-all overflow-visible"
+        className={`block w-full transition-all overflow-visible ${
+          compact ? 'h-1.5 group-hover:h-2.5' : 'h-2 group-hover:h-3'
+        }`}
         aria-label="Barre de progression chapitrée"
       >
         {normalizedChapters.map((chap, idx) => {

@@ -20,9 +20,13 @@ import type {
   YouTubeVideoItem,
 } from './src/types/broadcast.ts';
 import {
+  CURATED_VIDEO_CHAPTERS,
   classifyProgramTheme,
   ensureVideoChapters,
+  formatTimecode,
   getThemeDefinition,
+  isSyntheticChapterList,
+  parseDescriptionChapters,
 } from './src/utils/programMetadata.ts';
 
 dotenv.config();
@@ -30,6 +34,10 @@ dotenv.config();
 const PORT = Number(process.env.PORT) || 3000;
 const TWITCH_LOGIN = 'jlmelenchon';
 const YOUTUBE_CHANNEL_ID = 'UCk-_PEY3iC6DIGJKuoEe9bw';
+const YOUTUBE_CONFERENCES_PLAYLIST_ID = 'PLnAm9o_Xn_3CC7Oeg5-6clIrUzJE_qI1o';
+const YOUTUBE_VLOGS_PLAYLIST_ID = 'PLnAm9o_Xn_3CGqKhPyl4zYj1h05eLKrdm';
+const YOUTUBE_COULISSES_PLAYLIST_ID = 'PLnAm9o_Xn_3BEIRnIFuMZdoHr67HysgGK';
+const MIN_TV_PROGRAM_DURATION_SEC = 180; // Strictly exclude YouTube Shorts (< 3 min)
 const TWITCH_PUBLIC_CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
 
 const SERVER_BOOT_MS = Date.now();
@@ -58,6 +66,26 @@ function decodeXmlEntities(raw: string): string {
     .replace(/&#(\d+);/g, (_m, dec) => String.fromCharCode(Number(dec)));
 }
 
+function extractYoutubePlaylistId(input: string): string | null {
+  const trimmed = input.trim();
+  if (/^PL[a-zA-Z0-9_-]{12,48}$/.test(trimmed)) {
+    return trimmed;
+  }
+  try {
+    const url = new URL(trimmed);
+    if (url.hostname.includes('youtube.com')) {
+      const listId = url.searchParams.get('list');
+      const v = url.searchParams.get('v');
+      if (listId && !v && /^[a-zA-Z0-9_-]{10,60}$/.test(listId)) {
+        return listId;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 function extractYoutubeVideoId(input: string): string | null {
   const trimmed = input.trim();
   if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) {
@@ -70,9 +98,12 @@ function extractYoutubeVideoId(input: string): string | null {
       return /^[a-zA-Z0-9_-]{11}$/.test(id) ? id : null;
     }
     if (url.hostname.includes('youtube.com')) {
+      if (url.pathname.startsWith('/shorts/')) {
+        return null; // Reject YouTube Shorts links
+      }
       const v = url.searchParams.get('v');
       if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v;
-      const pathMatch = url.pathname.match(/\/(?:shorts|embed|live|v)\/([a-zA-Z0-9_-]{11})/);
+      const pathMatch = url.pathname.match(/\/(?:embed|live|v)\/([a-zA-Z0-9_-]{11})/);
       if (pathMatch) return pathMatch[1];
     }
   } catch {
@@ -138,36 +169,114 @@ function findMatchingTwitchArchive(youtubeTitle: string): YouTubeVideoItem | nul
 }
 
 const CUSTOM_VIDEOS_FILE = path.join(process.cwd(), 'data', 'custom-videos.json');
+const CHAPTERS_CACHE_FILE = path.join(process.cwd(), 'data', 'chapters-cache.json');
+
+interface CachedVideoMeta {
+  title?: string;
+  durationSeconds: number;
+  views: number;
+  rawChapters: VideoChapter[];
+  isShort?: boolean;
+  updatedAt: number;
+}
+
+const videoMetaCache = new Map<string, CachedVideoMeta>();
+const shortVideoIds = new Set<string>();
+const removedVideoIds = new Set<string>();
+
+function loadVideoMetaCache(): void {
+  try {
+    if (fs.existsSync(CHAPTERS_CACHE_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(CHAPTERS_CACHE_FILE, 'utf-8')) as Record<
+        string,
+        CachedVideoMeta
+      >;
+      for (const [id, entry] of Object.entries(parsed)) {
+        if (entry && typeof entry.durationSeconds === 'number') {
+          videoMetaCache.set(id, entry);
+          if (entry.isShort || (entry.durationSeconds > 0 && entry.durationSeconds < MIN_TV_PROGRAM_DURATION_SEC)) {
+            shortVideoIds.add(id);
+          }
+        }
+      }
+    }
+  } catch {
+    // Non-fatal
+  }
+}
+
+function saveVideoMetaCache(): void {
+  try {
+    const obj: Record<string, CachedVideoMeta> = {};
+    for (const [id, val] of videoMetaCache.entries()) {
+      obj[id] = val;
+    }
+    fs.mkdirSync(path.dirname(CHAPTERS_CACHE_FILE), { recursive: true });
+    fs.writeFileSync(CHAPTERS_CACHE_FILE, JSON.stringify(obj, null, 2), 'utf-8');
+  } catch {
+    // Non-fatal on read-only fs
+  }
+}
+
+loadVideoMetaCache();
 
 function hydrateVideoMetadata(
   raw: Omit<YouTubeVideoItem, 'theme' | 'chapters'> & {
     theme?: ProgramTheme;
     chapters?: VideoChapter[];
     description?: string;
+    chaptersHydrated?: boolean;
   }
 ): YouTubeVideoItem {
+  const cachedMeta = videoMetaCache.get(raw.id);
+  const resolvedDuration =
+    cachedMeta && cachedMeta.durationSeconds >= MIN_TV_PROGRAM_DURATION_SEC
+      ? cachedMeta.durationSeconds
+      : raw.durationSeconds;
+
   const theme = raw.theme || classifyProgramTheme(raw.title, raw.description || '');
+  const candidateRawChapters =
+    raw.chapters && !isSyntheticChapterList(raw.chapters)
+      ? raw.chapters
+      : cachedMeta?.rawChapters && cachedMeta.rawChapters.length >= 2
+        ? cachedMeta.rawChapters
+        : undefined;
+
   const chapters = ensureVideoChapters({
     id: raw.id,
     title: raw.title,
-    durationSeconds: raw.durationSeconds,
+    durationSeconds: resolvedDuration,
     theme,
     twitchVodId: raw.twitchVodId,
-    rawChapters: raw.chapters,
+    rawChapters: candidateRawChapters,
     description: raw.description,
   });
+
+  // Ensure duration is always strictly greater than the highest chapter timestamp
+  const highestChapSec = chapters.reduce((acc, c) => Math.max(acc, c.startSeconds), 0);
+  const safeDuration =
+    highestChapSec >= resolvedDuration ? highestChapSec + 600 : resolvedDuration;
+
+  const isHydrated = Boolean(
+    raw.chaptersHydrated ||
+      CURATED_VIDEO_CHAPTERS[raw.id] ||
+      (candidateRawChapters && candidateRawChapters.length >= 2) ||
+      cachedMeta
+  );
+
   return {
     id: raw.id,
     title: raw.title,
     publishedAt: raw.publishedAt,
     thumbnailUrl: raw.thumbnailUrl,
-    views: raw.views,
-    durationSeconds: raw.durationSeconds,
+    views: Math.max(raw.views || 0, cachedMeta?.views || 0),
+    durationSeconds: safeDuration,
     sourceType: raw.sourceType,
     ...(raw.twitchVodId ? { twitchVodId: raw.twitchVodId } : {}),
     ...(raw.twitchChannelLogin ? { twitchChannelLogin: raw.twitchChannelLogin } : {}),
     theme,
     chapters,
+    chaptersHydrated: isHydrated,
   };
 }
 
@@ -177,19 +286,175 @@ const DEFAULT_CUSTOM_VIDEOS: YouTubeVideoItem[] = [
     title: 'Jean-Luc Mélenchon : discussion sans filtre avec François Lenglet (Présidentielle 2027)',
     publishedAt: '2026-10-25T18:00:00Z',
     thumbnailUrl: 'https://i2.ytimg.com/vi/5qS3PZkpC64/hqdefault.jpg',
-    views: 1200000,
+    views: 1373327,
     durationSeconds: 8614,
     sourceType: 'custom',
     theme: 'entretiens',
   }),
+  hydrateVideoMetadata({
+    id: 'Xq8a165QzvQ',
+    title: 'Dans les coulisses de la présidentielle - Le chemin de la victoire (Vlog)',
+    publishedAt: '2026-10-22T18:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/Xq8a165QzvQ/hqdefault.jpg',
+    views: 277171,
+    durationSeconds: 5159,
+    sourceType: 'custom',
+    theme: 'vlogs',
+  }),
 ];
+
+/**
+ * Curated long-form JLM Vlogs, Conferences & Chaptered Interviews
+ * ensuring rich thematic coverage and zero YouTube Shorts.
+ */
+const CURATED_DOCUMENTARY_CATALOG: YouTubeVideoItem[] = [
+  hydrateVideoMetadata({
+    id: 'Xq8a165QzvQ',
+    title: 'Dans les coulisses de la présidentielle - Le chemin de la victoire (Vlog)',
+    publishedAt: '2026-10-22T18:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/Xq8a165QzvQ/hqdefault.jpg',
+    views: 277171,
+    durationSeconds: 5159,
+    sourceType: 'rss',
+    theme: 'vlogs',
+  }),
+  hydrateVideoMetadata({
+    id: '8xUoG4BRkqU',
+    title: 'Robots, IA, Espace - Vlog de Jean-Luc Mélenchon au salon VivaTech',
+    publishedAt: '2026-09-18T17:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/8xUoG4BRkqU/hqdefault.jpg',
+    views: 103548,
+    durationSeconds: 1368,
+    sourceType: 'rss',
+    theme: 'vlogs',
+  }),
+  hydrateVideoMetadata({
+    id: 'rLDEasxPkic',
+    title: 'Vlog au Festival d’Avignon — Culture, théâtre public et intermittents',
+    publishedAt: '2026-08-14T16:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/rLDEasxPkic/hqdefault.jpg',
+    views: 99945,
+    durationSeconds: 2145,
+    sourceType: 'rss',
+    theme: 'vlogs',
+  }),
+  hydrateVideoMetadata({
+    id: '5sJ6EWMmFf8',
+    title: 'Jusqu’à la victoire ! — Documentaire dans les coulisses de la campagne présidentielle',
+    publishedAt: '2026-07-20T18:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/5sJ6EWMmFf8/hqdefault.jpg',
+    views: 236546,
+    durationSeconds: 5859,
+    sourceType: 'rss',
+    theme: 'vlogs',
+  }),
+  hydrateVideoMetadata({
+    id: 'JJUpHvEunoA',
+    title: '3 heures pour penser le XXIe siècle avec Jean-Luc Mélenchon',
+    publishedAt: '2026-09-28T18:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/JJUpHvEunoA/hqdefault.jpg',
+    views: 441641,
+    durationSeconds: 11141,
+    sourceType: 'rss',
+    theme: 'conferences',
+  }),
+  hydrateVideoMetadata({
+    id: '25lLr3vUlws',
+    title: 'Présentation du programme L’Avenir en commun — édition 2025',
+    publishedAt: '2026-09-10T18:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/25lLr3vUlws/hqdefault.jpg',
+    views: 121910,
+    durationSeconds: 4468,
+    sourceType: 'rss',
+    theme: 'assemblee',
+  }),
+  hydrateVideoMetadata({
+    id: 'FzzQgJntbqQ',
+    title: 'Bataille de civilisation dans un monde en ruine ? — Jean-Luc Mélenchon (Thinkerview)',
+    publishedAt: '2026-08-29T19:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/FzzQgJntbqQ/hqdefault.jpg',
+    views: 859747,
+    durationSeconds: 9666,
+    sourceType: 'rss',
+    theme: 'entretiens',
+  }),
+  hydrateVideoMetadata({
+    id: 'RZTCInRezZU',
+    title: 'Discussion internationale : Jean-Luc Mélenchon avec HasanAbi',
+    publishedAt: '2026-08-05T19:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/RZTCInRezZU/hqdefault.jpg',
+    views: 236741,
+    durationSeconds: 5224,
+    sourceType: 'rss',
+    theme: 'international',
+  }),
+  hydrateVideoMetadata({
+    id: 'xbe3Gnv9YV8',
+    title: 'Mélenchon face au MEDEF : comprendre le débat économique (salaires, retraites, fiscalité, UE)',
+    publishedAt: '2026-07-12T17:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/xbe3Gnv9YV8/hqdefault.jpg',
+    views: 185400,
+    durationSeconds: 2120,
+    sourceType: 'rss',
+    theme: 'entretiens',
+  }),
+  hydrateVideoMetadata({
+    id: 'NrWl84bQRPY',
+    title: 'Les médias contre Mélenchon : 15 ans de conflictualité médiatique (Blast)',
+    publishedAt: '2026-06-25T17:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/NrWl84bQRPY/hqdefault.jpg',
+    views: 949172,
+    durationSeconds: 6998,
+    sourceType: 'rss',
+    theme: 'entretiens',
+  }),
+  hydrateVideoMetadata({
+    id: '4-dfHYMfSjI',
+    title: 'Présidentielle, abstention et stratégie de la « Nouvelle France » (Mediapart)',
+    publishedAt: '2026-06-10T18:00:00Z',
+    thumbnailUrl: 'https://i2.ytimg.com/vi/4-dfHYMfSjI/hqdefault.jpg',
+    views: 720355,
+    durationSeconds: 3787,
+    sourceType: 'rss',
+    theme: 'entretiens',
+  }),
+];
+
+function isShortOrInvalidTitle(title: string, description = ''): boolean {
+  return /(?:^|\s)#shorts?\b/i.test(`${title} ${description}`);
+}
 
 function loadSavedCustomVideos(): YouTubeVideoItem[] {
   try {
     if (fs.existsSync(CUSTOM_VIDEOS_FILE)) {
       const parsed = JSON.parse(fs.readFileSync(CUSTOM_VIDEOS_FILE, 'utf-8')) as unknown;
       if (Array.isArray(parsed) && parsed.length > 0) {
-        return (parsed as Array<YouTubeVideoItem>).map((item) => hydrateVideoMetadata(item));
+        const loaded = (parsed as Array<YouTubeVideoItem>)
+          .filter(
+            (item) =>
+              item &&
+              !shortVideoIds.has(item.id) &&
+              !isShortOrInvalidTitle(item.title || '') &&
+              (item.durationSeconds === undefined ||
+                item.durationSeconds === 0 ||
+                item.durationSeconds >= MIN_TV_PROGRAM_DURATION_SEC)
+          )
+          .map((item) =>
+            hydrateVideoMetadata({
+              ...item,
+              // Drop stale synthetic chapters so updated curated/real chapters take effect
+              chapters: isSyntheticChapterList(item.chapters) ? undefined : item.chapters,
+            })
+          );
+
+        // Ensure default flagship items (5qS3PZkpC64 & Xq8a165QzvQ) are present
+        const loadedIds = new Set(loaded.map((v) => v.id));
+        for (const def of DEFAULT_CUSTOM_VIDEOS) {
+          if (!loadedIds.has(def.id)) {
+            loaded.push(def);
+          }
+        }
+        return loaded;
       }
     }
   } catch {
@@ -285,10 +550,21 @@ function getProgramEntryOffsetSeconds(video?: YouTubeVideoItem | null): number {
   return 0;
 }
 
-const initialPlaylist: YouTubeVideoItem[] = [
-  ...loadSavedCustomVideos(),
-  ...FALLBACK_VIDEOS,
-];
+const initialPlaylist: YouTubeVideoItem[] = (() => {
+  const seen = new Set<string>();
+  const list: YouTubeVideoItem[] = [];
+  for (const v of [
+    ...loadSavedCustomVideos(),
+    ...FALLBACK_VIDEOS,
+    ...CURATED_DOCUMENTARY_CATALOG,
+  ]) {
+    if (!seen.has(v.id)) {
+      seen.add(v.id);
+      list.push(v);
+    }
+  }
+  return list;
+})();
 
 function buildKeepAliveStats(): KeepAliveStats {
   return {
@@ -307,6 +583,8 @@ let state: BroadcastState = {
   activeSource: 'youtube',
   activeThemeFilter: 'all',
   flashBannerTriggeredAt: 0,
+  leftBannerTriggeredAt: 0,
+  leftBannerManualIndex: -1,
   keepAlive: buildKeepAliveStats(),
   twitch: {
     isLive: false,
@@ -363,15 +641,69 @@ function computeDesiredSource(mode: BroadcastMode, isTwitchLive: boolean): Activ
 function rebuildCombinedPlaylist() {
   const currentPlayingId = state.playlist[state.currentIndex]?.id;
   const customVideos = state.playlist.filter(
-    (v) => v.sourceType === 'custom' && !unplayableVideoIds.has(v.id)
+    (v) =>
+      v.sourceType === 'custom' &&
+      !unplayableVideoIds.has(v.id) &&
+      !shortVideoIds.has(v.id) &&
+      !removedVideoIds.has(v.id)
   );
   const existingIds = new Set<string>();
   const combined: YouTubeVideoItem[] = [];
 
-  for (const item of [...customVideos, ...cachedArchiveItems, ...cachedYoutubeRssItems]) {
-    if (unplayableVideoIds.has(item.id) || existingIds.has(item.id)) continue;
+  for (const item of [
+    ...customVideos,
+    ...cachedArchiveItems,
+    ...cachedYoutubeRssItems,
+    ...CURATED_DOCUMENTARY_CATALOG,
+  ]) {
+    if (
+      unplayableVideoIds.has(item.id) ||
+      shortVideoIds.has(item.id) ||
+      removedVideoIds.has(item.id) ||
+      existingIds.has(item.id)
+    ) {
+      continue;
+    }
+    if (
+      item.sourceType !== 'custom' &&
+      item.durationSeconds > 0 &&
+      item.durationSeconds < MIN_TV_PROGRAM_DURATION_SEC
+    ) {
+      continue;
+    }
     existingIds.add(item.id);
     combined.push(item);
+  }
+
+  // Cross-match Twitch VODs with corresponding YouTube items so VODs inherit detailed chapters
+  for (const vod of combined) {
+    if (!vod.twitchVodId || !isSyntheticChapterList(vod.chapters)) continue;
+    const vodWords = normalizeWords(vod.title);
+    if (vodWords.length < 2) continue;
+    for (const yt of combined) {
+      if (yt.twitchVodId || isSyntheticChapterList(yt.chapters) || yt.chapters.length < 2) {
+        continue;
+      }
+      const ytWords = new Set(normalizeWords(yt.title));
+      const overlap = vodWords.filter((w) => ytWords.has(w)).length;
+      const ratio = overlap / Math.max(1, Math.min(vodWords.length, ytWords.size));
+      if (overlap >= 2 && ratio >= 0.65) {
+        const preRoll = getProgramEntryOffsetSeconds(vod);
+        const transferred: VideoChapter[] =
+          preRoll > 0 ? [{ startSeconds: 0, title: 'Pré-générique antenne' }] : [];
+        for (const ch of yt.chapters) {
+          const shifted = ch.startSeconds + preRoll;
+          if (shifted < vod.durationSeconds - 15) {
+            transferred.push({ startSeconds: shifted, title: ch.title });
+          }
+        }
+        if (transferred.length >= 2) {
+          vod.chapters = transferred;
+          vod.chaptersHydrated = true;
+          break;
+        }
+      }
+    }
   }
 
   if (combined.length > 0) {
@@ -572,42 +904,75 @@ async function probeTwitchChannel(): Promise<TwitchStatus> {
   return state.twitch;
 }
 
-async function syncYoutubeFeed(): Promise<void> {
+async function fetchYoutubeRssXmlItems(
+  rssUrl: string,
+  options: { defaultTheme?: ProgramTheme; maxItems?: number } = {}
+): Promise<YouTubeVideoItem[]> {
   try {
-    const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${YOUTUBE_CHANNEL_ID}`;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 5500);
     const res = await fetch(rssUrl, {
+      signal: ac.signal,
       headers: {
         'User-Agent': 'Mozilla/5.0 (compatible; JLMTelevisionBot/1.0)',
       },
     });
-    if (!res.ok) {
-      throw new Error(`YouTube RSS HTTP ${res.status}`);
-    }
+    clearTimeout(timer);
+    if (!res.ok) return [];
 
     const xml = await res.text();
     const rawEntries = xml.split('<entry>').slice(1);
-    const parsedItems: YouTubeVideoItem[] = [];
+    const items: YouTubeVideoItem[] = [];
 
     for (const entry of rawEntries) {
+      if (options.maxItems && items.length >= options.maxItems) break;
+
       const idMatch = entry.match(/<yt:videoId>([^<]+)<\/yt:videoId>/);
       const titleMatch = entry.match(/<title>([^<]+)<\/title>/);
+      const linkMatch = entry.match(/<link\s+rel="alternate"\s+href="([^"]+)"/);
       const pubMatch = entry.match(/<published>([^<]+)<\/published>/);
       const viewsMatch = entry.match(/<media:statistics\s+views="(\d+)"/);
       const descMatch = entry.match(/<media:description>([\s\S]*?)<\/media:description>/);
 
       if (!idMatch || !titleMatch) continue;
       const id = idMatch[1].trim();
-      if (unplayableVideoIds.has(id)) continue;
+      const linkHref = linkMatch?.[1] || '';
+
+      // Strictly reject YouTube Shorts (/shorts/<id> in RSS alternate link)
+      if (linkHref.includes('/shorts/')) {
+        shortVideoIds.add(id);
+        continue;
+      }
+      if (unplayableVideoIds.has(id) || shortVideoIds.has(id) || removedVideoIds.has(id)) {
+        continue;
+      }
 
       const views = viewsMatch ? Number(viewsMatch[1]) : 0;
       if (views === 0) continue;
 
       const title = decodeXmlEntities(titleMatch[1].trim());
       const description = descMatch ? decodeXmlEntities(descMatch[1].trim()) : '';
-      const publishedAt = pubMatch ? pubMatch[1].trim() : new Date().toISOString();
-      const cachedDuration = durationCache.get(id) ?? 1800;
+      if (isShortOrInvalidTitle(title, description)) {
+        shortVideoIds.add(id);
+        continue;
+      }
 
-      parsedItems.push(
+      const cachedMeta = videoMetaCache.get(id);
+      if (
+        cachedMeta &&
+        (cachedMeta.isShort ||
+          (cachedMeta.durationSeconds > 0 &&
+            cachedMeta.durationSeconds < MIN_TV_PROGRAM_DURATION_SEC))
+      ) {
+        shortVideoIds.add(id);
+        continue;
+      }
+
+      const publishedAt = pubMatch ? pubMatch[1].trim() : new Date().toISOString();
+      const cachedDuration =
+        cachedMeta?.durationSeconds || durationCache.get(id) || 2700;
+
+      items.push(
         hydrateVideoMetadata({
           id,
           title,
@@ -616,30 +981,295 @@ async function syncYoutubeFeed(): Promise<void> {
           views,
           durationSeconds: cachedDuration,
           sourceType: 'rss',
+          theme: options.defaultTheme,
           description,
         })
       );
     }
 
-    if (parsedItems.length > 0) {
-      cachedYoutubeRssItems = parsedItems;
+    return items;
+  } catch {
+    return [];
+  }
+}
+
+let isHydratingChapters = false;
+
+async function hydratePlaylistChaptersInBackground(forceRescan = false): Promise<void> {
+  if (isHydratingChapters) return;
+  isHydratingChapters = true;
+
+  try {
+    const candidates = state.playlist.filter((item) => {
+      if (item.twitchVodId || item.twitchChannelLogin) return false;
+      if (!/^[a-zA-Z0-9_-]{11}$/.test(item.id)) return false;
+      if (CURATED_VIDEO_CHAPTERS[item.id] && !forceRescan) return false;
+      const cached = videoMetaCache.get(item.id);
+      if (cached && !forceRescan && Date.now() - cached.updatedAt < 12 * 3600_000) {
+        return false;
+      }
+      return true;
+    });
+
+    if (candidates.length === 0) return;
+
+    let anyUpdated = false;
+    const batchSize = 3;
+
+    for (let i = 0; i < candidates.length; i += batchSize) {
+      const batch = candidates.slice(i, i + batchSize);
+      await Promise.all(
+        batch.map(async (item) => {
+          const details = await fetchYoutubeVideoDetails(item.id, forceRescan);
+          if (
+            details.isShort ||
+            (details.durationSeconds > 0 &&
+              details.durationSeconds < MIN_TV_PROGRAM_DURATION_SEC)
+          ) {
+            shortVideoIds.add(item.id);
+            cachedYoutubeRssItems = cachedYoutubeRssItems.filter((x) => x.id !== item.id);
+            anyUpdated = true;
+            return;
+          }
+
+          if (details.durationSeconds >= MIN_TV_PROGRAM_DURATION_SEC) {
+            durationCache.set(item.id, details.durationSeconds);
+          }
+
+          const updateTarget = (list: YouTubeVideoItem[]) => {
+            const idx = list.findIndex((x) => x.id === item.id);
+            if (idx >= 0) {
+              list[idx] = hydrateVideoMetadata({
+                ...list[idx],
+                durationSeconds:
+                  details.durationSeconds >= MIN_TV_PROGRAM_DURATION_SEC
+                    ? details.durationSeconds
+                    : list[idx].durationSeconds,
+                views: Math.max(list[idx].views, details.views),
+                chapters:
+                  details.rawChapters.length >= 2
+                    ? details.rawChapters
+                    : isSyntheticChapterList(list[idx].chapters)
+                      ? undefined
+                      : list[idx].chapters,
+                description: details.description,
+                chaptersHydrated: true,
+              });
+              anyUpdated = true;
+            }
+          };
+
+          updateTarget(cachedYoutubeRssItems);
+          updateTarget(state.playlist);
+        })
+      );
+    }
+
+    if (anyUpdated) {
+      saveVideoMetaCache();
       rebuildCombinedPlaylist();
       broadcastFullState();
+    }
+  } catch (err) {
+    console.warn('[Chapter Hydration Warning]:', err);
+  } finally {
+    isHydratingChapters = false;
+  }
+}
+
+async function syncYoutubeFeed(): Promise<void> {
+  try {
+    // Replace Shorts-heavy channel feed with:
+    // 1) Official Conferences Playlist (PLnAm9o_Xn_3CC7Oeg5-6clIrUzJE_qI1o)
+    // 2) Official Vlogs & Coulisses Playlists
+    // 3) Official Channel Feed strictly filtered to exclude all /shorts/
+    const [conferencesItems, vlogsItems, coulissesItems, channelLongItems] = await Promise.all([
+      fetchYoutubeRssXmlItems(
+        `https://www.youtube.com/feeds/videos.xml?playlist_id=${YOUTUBE_CONFERENCES_PLAYLIST_ID}`,
+        { defaultTheme: 'conferences', maxItems: 15 }
+      ),
+      fetchYoutubeRssXmlItems(
+        `https://www.youtube.com/feeds/videos.xml?playlist_id=${YOUTUBE_VLOGS_PLAYLIST_ID}`,
+        { defaultTheme: 'vlogs', maxItems: 8 }
+      ),
+      fetchYoutubeRssXmlItems(
+        `https://www.youtube.com/feeds/videos.xml?playlist_id=${YOUTUBE_COULISSES_PLAYLIST_ID}`,
+        { defaultTheme: 'vlogs', maxItems: 6 }
+      ),
+      fetchYoutubeRssXmlItems(
+        `https://www.youtube.com/feeds/videos.xml?channel_id=${YOUTUBE_CHANNEL_ID}`,
+        { maxItems: 15 }
+      ),
+    ]);
+
+    const seen = new Set<string>();
+    const merged: YouTubeVideoItem[] = [];
+    for (const item of [
+      ...conferencesItems,
+      ...channelLongItems,
+      ...vlogsItems,
+      ...coulissesItems,
+    ]) {
+      if (seen.has(item.id) || shortVideoIds.has(item.id)) continue;
+      seen.add(item.id);
+      merged.push(item);
+    }
+
+    if (merged.length > 0) {
+      cachedYoutubeRssItems = merged;
+      rebuildCombinedPlaylist();
+      broadcastFullState();
+      void hydratePlaylistChaptersInBackground(false);
     }
   } catch (err) {
     console.error('[YouTube RSS Sync Error]:', err);
   }
 }
 
-async function fetchYoutubeVideoDetails(videoId: string): Promise<{
+async function scrapeYoutubeWatchPageDetails(videoId: string): Promise<{
   title: string;
   durationSeconds: number;
   views: number;
   rawChapters: VideoChapter[];
   description: string;
+  isShort: boolean;
 }> {
   const browserUa =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 4500);
+    const res = await fetch(`https://www.youtube.com/watch?v=${videoId}&hl=fr`, {
+      signal: ac.signal,
+      headers: {
+        'User-Agent': browserUa,
+        'Accept-Language': 'fr-FR,fr;q=0.9',
+        Cookie: 'CONSENT=YES+cb.20210328-17-p0.en+FX+478',
+      },
+    });
+    clearTimeout(timer);
+    if (!res.ok) {
+      return {
+        title: '',
+        durationSeconds: 0,
+        views: 0,
+        rawChapters: [],
+        description: '',
+        isShort: false,
+      };
+    }
+
+    const html = await res.text();
+    const isShort =
+      html.includes(`"canonicalBaseUrl":"/shorts/${videoId}"`) ||
+      html.includes(`<link rel="canonical" href="https://www.youtube.com/shorts/${videoId}">`);
+
+    let title = '';
+    const titleMeta = html.match(/<meta\s+name="title"\s+content="([^"]+)"/i);
+    if (titleMeta?.[1]) {
+      title = decodeXmlEntities(titleMeta[1].trim());
+    }
+
+    let durationSeconds = 0;
+    const lenSecMatch = html.match(/"lengthSeconds":"(\d+)"/);
+    const approxMsMatch = html.match(/"approxDurationMs":"(\d+)"/);
+    if (lenSecMatch?.[1]) {
+      durationSeconds = Number(lenSecMatch[1]);
+    } else if (approxMsMatch?.[1]) {
+      durationSeconds = Math.round(Number(approxMsMatch[1]) / 1000);
+    }
+
+    let views = 0;
+    const viewCountMatch =
+      html.match(/itemprop="interactionCount"\s+content="(\d+)"/) ||
+      html.match(/"viewCount":"(\d+)"/);
+    if (viewCountMatch?.[1]) {
+      views = Number(viewCountMatch[1]);
+    }
+
+    let description = '';
+    const shortDescMatch = html.match(/"shortDescription":"((?:\\.|[^"\\])*)"/);
+    if (shortDescMatch?.[1]) {
+      try {
+        description = JSON.parse(`"${shortDescMatch[1]}"`) as string;
+      } catch {
+        description = '';
+      }
+    }
+
+    const chapterMap = new Map<number, string>();
+    const chMatches = html.matchAll(
+      /"chapterRenderer":\{"title":\{"simpleText":"((?:\\.|[^"\\])*)"\},"timeRangeStartMillis":(\d+)/g
+    );
+    for (const m of chMatches) {
+      const startSeconds = Math.round(Number(m[2]) / 1000);
+      if (startSeconds >= 0 && !chapterMap.has(startSeconds)) {
+        try {
+          const parsedTitle = (JSON.parse(`"${m[1]}"`) as string).trim();
+          if (parsedTitle) chapterMap.set(startSeconds, parsedTitle);
+        } catch {
+          // Ignore malformed escape
+        }
+      }
+    }
+
+    let rawChapters: VideoChapter[] = [...chapterMap.entries()]
+      .map(([startSeconds, chapTitle]) => ({ startSeconds, title: chapTitle }))
+      .sort((a, b) => a.startSeconds - b.startSeconds);
+
+    if (rawChapters.length < 2 && description) {
+      rawChapters = parseDescriptionChapters(description, durationSeconds);
+    }
+
+    return { title, durationSeconds, views, rawChapters, description, isShort };
+  } catch {
+    return {
+      title: '',
+      durationSeconds: 0,
+      views: 0,
+      rawChapters: [],
+      description: '',
+      isShort: false,
+    };
+  }
+}
+
+async function fetchYoutubeVideoDetails(
+  videoId: string,
+  bypassCache = false
+): Promise<{
+  title: string;
+  durationSeconds: number;
+  views: number;
+  rawChapters: VideoChapter[];
+  description: string;
+  isShort?: boolean;
+}> {
+  if (!bypassCache) {
+    const cached = videoMetaCache.get(videoId);
+    if (cached && cached.durationSeconds > 0 && cached.rawChapters.length >= 2) {
+      return {
+        title: cached.title || '',
+        durationSeconds: cached.durationSeconds,
+        views: cached.views,
+        rawChapters: cached.rawChapters,
+        description: '',
+        isShort: cached.isShort,
+      };
+    }
+  }
+
+  const browserUa =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
+
+  let pipedResult: {
+    title: string;
+    durationSeconds: number;
+    views: number;
+    rawChapters: VideoChapter[];
+    description: string;
+    isShort: boolean;
+  } | null = null;
 
   // 1. Fast Piped metadata API (~200ms, returns exact durationSeconds + views + title + chapters)
   try {
@@ -656,12 +1286,13 @@ async function fetchYoutubeVideoDetails(videoId: string): Promise<{
         duration?: number;
         views?: number;
         description?: string;
+        isShort?: boolean;
         chapters?: Array<{ title?: string; start?: number }>;
       };
       if (data.title && data.duration && data.duration > 0) {
         const dur = Math.round(data.duration);
         durationCache.set(videoId, dur);
-        const rawChapters: VideoChapter[] = Array.isArray(data.chapters)
+        let rawChapters: VideoChapter[] = Array.isArray(data.chapters)
           ? data.chapters
               .filter(
                 (c): c is { title: string; start: number } =>
@@ -675,12 +1306,17 @@ async function fetchYoutubeVideoDetails(videoId: string): Promise<{
                 startSeconds: Math.round(c.start),
               }))
           : [];
-        return {
+        const description = typeof data.description === 'string' ? data.description : '';
+        if (rawChapters.length < 2 && description) {
+          rawChapters = parseDescriptionChapters(description, dur);
+        }
+        pipedResult = {
           title: data.title.trim(),
           durationSeconds: dur,
           views: data.views ?? 0,
           rawChapters,
-          description: typeof data.description === 'string' ? data.description : '',
+          description,
+          isShort: Boolean(data.isShort),
         };
       }
     }
@@ -688,7 +1324,68 @@ async function fetchYoutubeVideoDetails(videoId: string): Promise<{
     // Fallback below
   }
 
-  // 2. Fallback: PokeTube OpenGraph meta + YouTube OEmbed
+  // 2. Direct YouTube Watch HTML scraper (retrieves official chapterRenderer markers even when Piped returns 0 chapters!)
+  if (!pipedResult || pipedResult.rawChapters.length < 2) {
+    const watchData = await scrapeYoutubeWatchPageDetails(videoId);
+    if (pipedResult) {
+      if (watchData.rawChapters.length >= 2) {
+        pipedResult.rawChapters = watchData.rawChapters;
+      }
+      if (!pipedResult.description && watchData.description) {
+        pipedResult.description = watchData.description;
+      }
+      if (watchData.isShort) {
+        pipedResult.isShort = true;
+      }
+    } else if (watchData.title || watchData.durationSeconds > 0 || watchData.rawChapters.length > 0) {
+      pipedResult = {
+        title: watchData.title,
+        durationSeconds: watchData.durationSeconds,
+        views: watchData.views,
+        rawChapters: watchData.rawChapters,
+        description: watchData.description,
+        isShort: watchData.isShort,
+      };
+    }
+  }
+
+  if (pipedResult && (pipedResult.title || pipedResult.durationSeconds > 0)) {
+    const finalDur = pipedResult.durationSeconds || durationCache.get(videoId) || 3600;
+    let finalTitle = pipedResult.title;
+    if (!finalTitle) {
+      try {
+        const oe = await fetch(
+          `https://www.youtube.com/oembed?url=${encodeURIComponent(
+            `https://www.youtube.com/watch?v=${videoId}`
+          )}&format=json`
+        );
+        if (oe.ok) {
+          const d = (await oe.json()) as { title?: string };
+          if (d.title) finalTitle = d.title.trim();
+        }
+      } catch {
+        // Ignore
+      }
+    }
+    videoMetaCache.set(videoId, {
+      title: finalTitle || undefined,
+      durationSeconds: finalDur,
+      views: pipedResult.views,
+      rawChapters: pipedResult.rawChapters,
+      isShort: pipedResult.isShort,
+      updatedAt: Date.now(),
+    });
+    return {
+      title: finalTitle || `Vidéo YouTube (${videoId})`,
+      durationSeconds: finalDur,
+      views: pipedResult.views,
+      rawChapters: pipedResult.rawChapters,
+      description: pipedResult.description,
+      isShort: pipedResult.isShort,
+    };
+  }
+
+  // 3. Fallback: PokeTube OpenGraph meta + YouTube OEmbed
   let fallbackDuration = durationCache.get(videoId) ?? 3600;
   let fallbackTitle = '';
   try {
@@ -1561,7 +2258,9 @@ wss.on('connection', (socket) => {
               state.activeSource = 'youtube';
             }
             appendTransition(
-              `Sélection directe : ${state.playlist[idx].title}`,
+              requestedStart !== null
+                ? `Sélection directe à ${formatTimecode(offsetSec)} : ${state.playlist[idx].title}`
+                : `Sélection directe : ${state.playlist[idx].title}`,
               state.activeSource
             );
             broadcastFullState();
@@ -1615,8 +2314,9 @@ wss.on('connection', (socket) => {
           const allowedThemes: Array<ProgramTheme | 'all'> = [
             'all',
             'entretiens',
-            'meetings',
             'conferences',
+            'vlogs',
+            'meetings',
             'assemblee',
             'international',
           ];
@@ -1654,6 +2354,18 @@ wss.on('connection', (socket) => {
           break;
         }
 
+        case 'banner:left': {
+          const requestedIdx = msg.payload?.bannerIndex;
+          if (typeof requestedIdx === 'number' && requestedIdx >= 0 && requestedIdx <= 8) {
+            state.leftBannerManualIndex = Math.floor(requestedIdx);
+          } else {
+            state.leftBannerManualIndex = ((state.leftBannerManualIndex ?? -1) + 1) % 9;
+          }
+          state.leftBannerTriggeredAt = Date.now();
+          broadcastFullState();
+          break;
+        }
+
         case 'playlist:add': {
           const rawUrl = String(msg.payload?.url || '');
           const playImmediately = Boolean(msg.payload?.playNow);
@@ -1666,6 +2378,7 @@ wss.on('connection', (socket) => {
           if (state.playlist.length <= 1) break;
           const idx = state.playlist.findIndex((v) => v.id === videoId);
           if (idx >= 0) {
+            removedVideoIds.add(videoId);
             const wasCurrent = idx === state.currentIndex;
             state.playlist = state.playlist.filter((v) => v.id !== videoId);
             if (state.currentIndex >= state.playlist.length) {
@@ -2025,19 +2738,88 @@ async function addMediaItemToPlaylist(
     }
   }
 
-  // 3. YouTube Video URL or 11-char ID (Direct MP4 Proxy works in both Web & Discord Activity!)
+  // 3. YouTube Playlist URL (e.g. https://www.youtube.com/playlist?list=PL...)
+  const playlistId = extractYoutubePlaylistId(rawUrl);
+  if (playlistId) {
+    const playlistItems = await fetchYoutubeRssXmlItems(
+      `https://www.youtube.com/feeds/videos.xml?playlist_id=${encodeURIComponent(playlistId)}`,
+      { maxItems: 15 }
+    );
+    if (playlistItems.length === 0) {
+      return {
+        ok: false,
+        discordSupported: false,
+        message: 'Playlist YouTube introuvable ou ne contenant que des Shorts.',
+      };
+    }
+
+    const existingIds = new Set(state.playlist.map((v) => v.id));
+    const addedItems: YouTubeVideoItem[] = [];
+    for (const item of playlistItems) {
+      removedVideoIds.delete(item.id);
+      if (!existingIds.has(item.id)) {
+        addedItems.push({ ...item, sourceType: 'custom' });
+        existingIds.add(item.id);
+      }
+    }
+
+    if (addedItems.length > 0) {
+      state.playlist = [...addedItems, ...state.playlist];
+      if (playImmediately) {
+        state.currentIndex = 0;
+        state.currentVideoStartedAt = Date.now();
+        if (state.activeSource === 'twitch') {
+          state.mode = 'force_youtube';
+          state.activeSource = 'youtube';
+        }
+      } else {
+        state.currentIndex += addedItems.length;
+      }
+      saveCustomVideos(state.playlist);
+      broadcastFullState();
+      void hydratePlaylistChaptersInBackground(false);
+    }
+
+    return {
+      ok: true,
+      discordSupported: true,
+      message: `${addedItems.length || playlistItems.length} vidéos longues importées depuis la playlist (Shorts exclus).`,
+      item: addedItems[0] || playlistItems[0],
+    };
+  }
+
+  // 4. Reject explicit YouTube Shorts links
+  if (/youtube\.com\/shorts\//i.test(rawUrl)) {
+    return {
+      ok: false,
+      discordSupported: false,
+      message:
+        'Les YouTube Shorts sont désactivés dans la programmation TV H24. Ajoutez une vidéo longue ou une playlist.',
+    };
+  }
+
+  // 5. YouTube Video URL or 11-char ID (Direct MP4 Proxy works in both Web & Discord Activity!)
   const videoId = extractYoutubeVideoId(rawUrl);
   if (!videoId) {
     return {
       ok: false,
       discordSupported: false,
       message:
-        'Lien non reconnu. Collez un lien YouTube (watch?v=..., youtu.be/...) ou un lien Twitch.',
+        'Lien non reconnu. Collez un lien YouTube (watch?v=..., playlist?list=...) ou un lien Twitch.',
     };
   }
 
   unplayableVideoIds.delete(videoId);
-  const details = await fetchYoutubeVideoDetails(videoId);
+  removedVideoIds.delete(videoId);
+  const details = await fetchYoutubeVideoDetails(videoId, true);
+
+  if (details.isShort) {
+    return {
+      ok: false,
+      discordSupported: false,
+      message: 'Cette vidéo est un YouTube Short : seuls les formats longs sont diffusés sur l’antenne.',
+    };
+  }
 
   const existingIdx = state.playlist.findIndex((v) => v.id === videoId);
   const newItem: YouTubeVideoItem = hydrateVideoMetadata({
@@ -2050,6 +2832,7 @@ async function addMediaItemToPlaylist(
     sourceType: 'custom',
     chapters: details.rawChapters,
     description: details.description,
+    chaptersHydrated: true,
   });
 
   if (existingIdx === -1) {
@@ -2070,6 +2853,7 @@ async function addMediaItemToPlaylist(
           ? details.rawChapters
           : state.playlist[existingIdx].chapters,
       description: details.description,
+      chaptersHydrated: true,
     });
     if (playImmediately) {
       state.currentIndex = existingIdx;
@@ -2088,6 +2872,7 @@ async function addMediaItemToPlaylist(
   }
 
   saveCustomVideos(state.playlist);
+  saveVideoMetaCache();
   broadcastFullState();
 
   return {
@@ -2133,12 +2918,16 @@ app.get('/api/tv/youtube-search', async (req, res) => {
         uploaderName?: string;
         duration?: number;
         views?: number;
+        isShort?: boolean;
       }>;
     };
     const results = (data.items || [])
       .map((item) => {
+        if (item.isShort || item.url?.includes('/shorts/')) return null;
         const vid = item.url ? extractYoutubeVideoId(`https://www.youtube.com${item.url}`) : null;
-        if (!vid || !item.title || !item.duration || item.duration <= 0) return null;
+        if (!vid || !item.title || !item.duration || item.duration < MIN_TV_PROGRAM_DURATION_SEC) {
+          return null;
+        }
         return {
           videoId: vid,
           title: item.title,
@@ -2168,6 +2957,12 @@ app.post('/api/tv/playlist/add', async (req, res) => {
 
 app.post('/api/tv/probe', async (_req, res) => {
   await Promise.all([probeTwitchChannel(), syncYoutubeFeed()]);
+  res.json(getPublicState());
+});
+
+app.post('/api/tv/chapters/refresh', async (_req, res) => {
+  await syncYoutubeFeed();
+  await hydratePlaylistChaptersInBackground(true);
   res.json(getPublicState());
 });
 

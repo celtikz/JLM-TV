@@ -3,8 +3,9 @@ export type ActiveSource = 'twitch' | 'youtube';
 
 export type ProgramTheme =
   | 'entretiens'
-  | 'meetings'
   | 'conferences'
+  | 'vlogs'
+  | 'meetings'
   | 'assemblee'
   | 'international';
 
@@ -37,6 +38,7 @@ export interface YouTubeVideoItem {
   twitchChannelLogin?: string;
   theme: ProgramTheme;
   chapters: VideoChapter[];
+  chaptersHydrated?: boolean;
 }
 
 export interface TransitionLog {
@@ -68,6 +70,8 @@ export interface BroadcastState {
   activeSource: ActiveSource;
   activeThemeFilter: ProgramTheme | 'all';
   flashBannerTriggeredAt: number;
+  leftBannerTriggeredAt?: number;
+  leftBannerManualIndex?: number;
   keepAlive: KeepAliveStats;
   twitch: TwitchStatus;
   playlist: YouTubeVideoItem[];

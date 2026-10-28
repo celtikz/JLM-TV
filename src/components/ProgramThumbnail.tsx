@@ -8,6 +8,7 @@ interface ProgramThumbnailProps {
   thumbnailUrl?: string;
   title: string;
   durationSeconds?: number;
+  startTimecodeSeconds?: number;
   isCurrent?: boolean;
   isQueuedNext?: boolean;
   showHoverPlay?: boolean;
@@ -35,6 +36,7 @@ export function ProgramThumbnail({
   thumbnailUrl,
   title,
   durationSeconds,
+  startTimecodeSeconds,
   isCurrent = false,
   isQueuedNext = false,
   showHoverPlay = true,
@@ -85,7 +87,7 @@ export function ProgramThumbnail({
         </div>
       )}
 
-      {/* Status Overlay (Bottom-Left) */}
+      {/* Status or Start Timecode Overlay (Bottom-Left) */}
       {isCurrent ? (
         <span className="absolute bottom-1.5 left-1.5 px-1.5 py-0.5 rounded bg-white text-black text-[10px] font-mono font-bold tracking-wide uppercase shadow">
           À l’antenne
@@ -93,6 +95,10 @@ export function ProgramThumbnail({
       ) : isQueuedNext ? (
         <span className="absolute bottom-1.5 left-1.5 px-1.5 py-0.5 rounded bg-black/90 text-white border border-white/30 text-[10px] font-mono font-semibold tracking-wide uppercase shadow">
           À suivre
+        </span>
+      ) : typeof startTimecodeSeconds === 'number' ? (
+        <span className="absolute bottom-1.5 left-1.5 px-1.5 py-0.5 rounded bg-white text-black text-[11px] font-mono tabular-nums font-bold leading-none shadow">
+          À {formatTimecode(startTimecodeSeconds)}
         </span>
       ) : null}
 

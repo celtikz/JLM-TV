@@ -10,6 +10,9 @@ import {
   Maximize2,
   ListOrdered,
   Bell,
+  Eye,
+  EyeOff,
+  ChevronRight,
   ArrowUpLeft,
 } from 'lucide-react';
 import type {
@@ -18,7 +21,10 @@ import type {
   TwitchStatus,
   YouTubeVideoItem,
 } from '../types/broadcast';
-import { isRunningInDiscordProxy } from '../hooks/useDiscordActivity';
+import {
+  handleDiscordAwareLinkClick,
+  isRunningInDiscordProxy,
+} from '../hooks/useDiscordActivity';
 import {
   formatBroadcastHour,
   formatTimecode,
@@ -28,7 +34,8 @@ import {
 } from '../utils/programMetadata';
 import { HlsVideoStream } from './HlsVideoStream';
 import { ChapterTimeline } from './ChapterTimeline';
-import { TvFlashBanner } from './TvFlashBanner';
+import { TvLeftCommunityBanner } from './TvLeftCommunityBanner';
+import { useProgramScheduleVisibility } from '../utils/bannerSync';
 
 const STUDIO_SLATE_IMG = '/src/assets/images/tv_broadcast_slate_1793131336238.jpg';
 
@@ -39,6 +46,10 @@ interface TvPlayerProps {
   currentIndex: number;
   activeThemeFilter: ProgramTheme | 'all';
   flashBannerTriggeredAt: number;
+  leftBannerTriggeredAt?: number;
+  leftBannerManualIndex?: number;
+  leftBannersEnabled: boolean;
+  onToggleLeftBanners: (nextValue?: boolean) => void;
   currentVideo: YouTubeVideoItem | null;
   currentVideoStartedAt: number;
   clockOffsetMs: number;
@@ -48,6 +59,7 @@ interface TvPlayerProps {
   onNextVideo: () => void;
   onSeekSeconds: (seconds: number) => void;
   onTriggerFlashBanner: () => void;
+  onTriggerLeftBanner: () => void;
   onSwitchToYoutube: () => void;
   onEnterFullScreenTv: () => void;
   onReportDuration: (videoId: string, durationSeconds: number) => void;
@@ -62,6 +74,10 @@ export function TvPlayer({
   currentIndex,
   activeThemeFilter,
   flashBannerTriggeredAt,
+  leftBannerTriggeredAt = 0,
+  leftBannerManualIndex = 0,
+  leftBannersEnabled,
+  onToggleLeftBanners,
   currentVideo,
   currentVideoStartedAt,
   clockOffsetMs,
@@ -71,6 +87,7 @@ export function TvPlayer({
   onNextVideo,
   onSeekSeconds,
   onTriggerFlashBanner,
+  onTriggerLeftBanner,
   onSwitchToYoutube,
   onEnterFullScreenTv,
   onReportDuration,
@@ -217,6 +234,12 @@ export function TvPlayer({
 
   const showOfflineSlate = activeSource === 'twitch' && !twitch.isLive;
   const currentTheme = getThemeDefinition(currentVideo?.theme);
+  const isProgramCardVisible = useProgramScheduleVisibility({
+    clockOffsetMs,
+    flashBannerTriggeredAt,
+    enabled: leftBannersEnabled,
+    suppressed: showOfflineSlate || miniMode,
+  });
 
   return (
     <div
@@ -304,18 +327,22 @@ export function TvPlayer({
           </div>
         )}
 
-        {/* Compact Bottom-Right TV Promo Vignette ("À suivre...") */}
+        {/* Unified Square Broadcast Lower-Third: Left Programmation (10s/5m) + JLMTV + White Links Bandeau */}
         {!showOfflineSlate && !miniMode && (
-          <TvFlashBanner
+          <TvLeftCommunityBanner
             activeSource={activeSource}
             twitch={twitch}
             playlist={playlist}
             currentIndex={currentIndex}
             activeThemeFilter={activeThemeFilter}
             currentVideoStartedAt={currentVideoStartedAt}
-            clockOffsetMs={clockOffsetMs}
             flashBannerTriggeredAt={flashBannerTriggeredAt}
-            elevatedAboveControls={controlsVisible}
+            clockOffsetMs={clockOffsetMs}
+            leftBannerTriggeredAt={leftBannerTriggeredAt}
+            leftBannerManualIndex={leftBannerManualIndex}
+            enabled={leftBannersEnabled}
+            programCardVisible={isProgramCardVisible}
+            onToggleEnabled={onToggleLeftBanners}
           />
         )}
 
@@ -347,131 +374,171 @@ export function TvPlayer({
           </div>
         )}
 
-        {/* Bottom Player Overlay (full mode only) */}
+        {/* Hover Player Controls: Positioned cleanly in the empty slot above the White Bandeau & to the right of Programmation */}
         {!miniMode && (
           <div
-            onMouseEnter={() => {
-              isHoveringBarRef.current = true;
-              clearTimers();
-              setControlsVisible(true);
-            }}
-            onMouseLeave={() => {
-              isHoveringBarRef.current = false;
-            }}
-            className={`absolute bottom-0 inset-x-0 z-20 px-6 pb-5 pt-14 bg-gradient-to-t from-black/95 via-black/70 to-transparent transition-opacity duration-150 ease-out ${
-              controlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+            className={`absolute z-30 pointer-events-none transition-[left,bottom] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+              !showOfflineSlate && leftBannersEnabled
+                ? 'bottom-[46px] sm:bottom-[54px] lg:bottom-[58px]'
+                : 'bottom-0'
+            } ${
+              !showOfflineSlate && isProgramCardVisible
+                ? 'left-[114px] sm:left-[162px] lg:left-[184px] right-0'
+                : 'left-0 right-0'
             }`}
           >
-            {activeSource === 'youtube' &&
-              currentVideo &&
-              !currentVideo.twitchChannelLogin &&
-              currentVideo.durationSeconds > 0 && (
-                <div className="mb-2">
-                  <ChapterTimeline
-                    durationSeconds={currentVideo.durationSeconds}
-                    positionSeconds={positionInVideo}
-                    chapters={currentVideo.chapters}
-                    onSeekSeconds={onSeekSeconds}
+            <div
+              onMouseEnter={() => {
+                isHoveringBarRef.current = true;
+                clearTimers();
+                setControlsVisible(true);
+              }}
+              onMouseLeave={() => {
+                isHoveringBarRef.current = false;
+              }}
+              className={`px-3 sm:px-4 pt-1.5 pb-2 bg-black/88 backdrop-blur-md border-t border-white/15 transition-opacity duration-150 ease-out ${
+                controlsVisible ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
+              }`}
+            >
+              {activeSource === 'youtube' &&
+                currentVideo &&
+                !currentVideo.twitchChannelLogin &&
+                currentVideo.durationSeconds > 0 && (
+                  <div className="mb-1">
+                    <ChapterTimeline
+                      compact
+                      durationSeconds={currentVideo.durationSeconds}
+                      positionSeconds={positionInVideo}
+                      chapters={currentVideo.chapters}
+                      onSeekSeconds={onSeekSeconds}
+                    />
+                  </div>
+                )}
+
+              <div className="flex items-center justify-between gap-2 overflow-x-auto">
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={handleToggleMute}
+                    title={isMuted ? 'Activer le son' : 'Couper le son'}
+                    className={`h-8 w-8 inline-flex items-center justify-center rounded-lg border transition-colors cursor-pointer shrink-0 ${
+                      isMuted
+                        ? 'bg-white text-black border-white hover:bg-neutral-200'
+                        : 'bg-black/80 text-white border-white/20 hover:bg-white/15'
+                    }`}
+                  >
+                    {isMuted ? (
+                      <VolumeX className="w-3.5 h-3.5 shrink-0" />
+                    ) : (
+                      <Volume2 className="w-3.5 h-3.5 shrink-0" />
+                    )}
+                  </button>
+
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={isMuted ? 0 : volumePercent}
+                    onChange={(e) => handleVolumeChange(Number(e.target.value))}
+                    aria-label="Volume sonore pourcent par pourcent"
+                    className="mono-slider w-16 sm:w-20 cursor-pointer shrink-0"
                   />
-                </div>
-              )}
 
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <div className="flex items-center gap-3.5">
-                <button
-                  type="button"
-                  onClick={handleToggleMute}
-                  title={isMuted ? 'Activer le son' : 'Couper le son'}
-                  className={`h-10 w-10 inline-flex items-center justify-center rounded-xl border transition-colors cursor-pointer ${
-                    isMuted
-                      ? 'bg-white text-black border-white hover:bg-neutral-200'
-                      : 'bg-black/80 text-white border-white/20 hover:bg-white/15'
-                  }`}
-                >
-                  {isMuted ? (
-                    <VolumeX className="w-4 h-4 shrink-0" />
-                  ) : (
-                    <Volume2 className="w-4 h-4 shrink-0" />
-                  )}
-                </button>
-
-                <input
-                  type="range"
-                  min={0}
-                  max={100}
-                  step={1}
-                  value={isMuted ? 0 : volumePercent}
-                  onChange={(e) => handleVolumeChange(Number(e.target.value))}
-                  aria-label="Volume sonore pourcent par pourcent"
-                  className="mono-slider w-24 sm:w-32 cursor-pointer"
-                />
-
-                <span className="w-10 text-right text-xs font-mono tabular-nums text-neutral-200">
-                  {isMuted ? 0 : volumePercent}%
-                </span>
-
-                {activeSource === 'youtube' && currentVideo && !currentVideo.twitchChannelLogin && (
-                  <span className="text-xs font-mono tabular-nums text-neutral-300 pl-2 border-l border-white/15">
-                    {formatTimecode(positionInVideo)} / {formatTimecode(currentVideo.durationSeconds)}
+                  <span className="w-8 text-right text-[11px] font-mono tabular-nums text-neutral-200 shrink-0">
+                    {isMuted ? 0 : volumePercent}%
                   </span>
-                )}
-              </div>
 
-              <div className="flex flex-wrap items-center gap-2.5">
-                {activeSource === 'youtube' && (
-                  <>
-                    <button
-                      type="button"
-                      onClick={onPrevVideo}
-                      title="Programme précédent"
-                      className="h-10 inline-flex items-center gap-2 px-3.5 text-xs font-medium text-white bg-black/80 hover:bg-white/15 border border-white/20 rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                    >
-                      <SkipBack className="w-4 h-4 shrink-0" />
-                      <span className="hidden sm:inline">Précédent</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (currentVideo) {
-                          onSeekSeconds(positionInVideo + 300);
-                        }
-                      }}
-                      title="Avancer de 5 minutes"
-                      className="h-10 inline-flex items-center px-3.5 text-xs font-mono font-medium text-white bg-black/80 hover:bg-white/15 border border-white/20 rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                    >
-                      +5m
-                    </button>
-                    <button
-                      type="button"
-                      onClick={onNextVideo}
-                      title="Programme suivant"
-                      className="h-10 inline-flex items-center gap-2 px-3.5 text-xs font-medium text-white bg-black/80 hover:bg-white/15 border border-white/20 rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                    >
-                      <span className="hidden sm:inline">Suivant</span>
-                      <SkipForward className="w-4 h-4 shrink-0" />
-                    </button>
-                  </>
-                )}
+                  {activeSource === 'youtube' &&
+                    currentVideo &&
+                    !currentVideo.twitchChannelLogin && (
+                      <span className="hidden sm:inline text-[11px] font-mono tabular-nums text-neutral-300 pl-2 border-l border-white/15 whitespace-nowrap shrink-0">
+                        {formatTimecode(positionInVideo)} /{' '}
+                        {formatTimecode(currentVideo.durationSeconds)}
+                      </span>
+                    )}
+                </div>
 
-                <button
-                  type="button"
-                  onClick={handleResync}
-                  title="Resynchroniser sur le direct H24"
-                  className="h-10 inline-flex items-center gap-2 px-3.5 text-xs font-medium text-white bg-black/80 hover:bg-white/15 border border-white/20 rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  <RefreshCw className="w-4 h-4 shrink-0" />
-                  <span className="hidden xl:inline">Direct</span>
-                </button>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {activeSource === 'youtube' && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={onPrevVideo}
+                        title="Programme précédent"
+                        className="h-8 inline-flex items-center gap-1.5 px-2.5 text-xs font-medium text-white bg-black/80 hover:bg-white/15 border border-white/20 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        <SkipBack className="w-3.5 h-3.5 shrink-0" />
+                        <span className="hidden 2xl:inline">Précédent</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (currentVideo) {
+                            onSeekSeconds(positionInVideo + 300);
+                          }
+                        }}
+                        title="Avancer de 5 minutes"
+                        className="h-8 inline-flex items-center px-2 text-[11px] font-mono font-medium text-white bg-black/80 hover:bg-white/15 border border-white/20 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        +5m
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onNextVideo}
+                        title="Programme suivant"
+                        className="h-8 inline-flex items-center gap-1.5 px-2.5 text-xs font-medium text-white bg-black/80 hover:bg-white/15 border border-white/20 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        <span className="hidden 2xl:inline">Suivant</span>
+                        <SkipForward className="w-3.5 h-3.5 shrink-0" />
+                      </button>
+                    </>
+                  )}
 
-                <button
-                  type="button"
-                  onClick={onEnterFullScreenTv}
-                  title="Plein écran TV pur"
-                  className="h-10 inline-flex items-center gap-2 px-4 text-xs font-semibold text-black bg-white hover:bg-neutral-200 rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  <Maximize2 className="w-4 h-4 shrink-0" />
-                  <span>Plein écran TV</span>
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => onToggleLeftBanners()}
+                    title={
+                      leftBannersEnabled
+                        ? 'Masquer le bandeau TV (programmation et liens)'
+                        : 'Afficher le bandeau TV (programmation et liens)'
+                    }
+                    className={`h-8 inline-flex items-center gap-1.5 px-2.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      leftBannersEnabled
+                        ? 'bg-black/80 text-white border-white/25 hover:bg-white/15'
+                        : 'bg-neutral-900/90 text-neutral-400 border-white/15 hover:text-white hover:bg-white/15'
+                    }`}
+                  >
+                    {leftBannersEnabled ? (
+                      <Eye className="w-3.5 h-3.5 shrink-0" />
+                    ) : (
+                      <EyeOff className="w-3.5 h-3.5 shrink-0" />
+                    )}
+                    <span className="hidden xl:inline">
+                      {leftBannersEnabled ? 'Bandeau : ON' : 'Bandeau : OFF'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleResync}
+                    title="Resynchroniser sur le direct H24"
+                    className="h-8 inline-flex items-center gap-1.5 px-2.5 text-xs font-medium text-white bg-black/80 hover:bg-white/15 border border-white/20 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5 shrink-0" />
+                    <span className="hidden 2xl:inline">Direct</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={onEnterFullScreenTv}
+                    title="Plein écran TV pur"
+                    className="h-8 inline-flex items-center gap-1.5 px-3 text-xs font-semibold text-black bg-white hover:bg-neutral-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Maximize2 className="w-3.5 h-3.5 shrink-0" />
+                    <span className="hidden md:inline">Plein écran</span>
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -575,14 +642,51 @@ export function TvPlayer({
             </div>
 
             <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+              <div className="inline-flex items-center rounded-xl border border-neutral-800 bg-neutral-900 overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => onToggleLeftBanners()}
+                  title={
+                    leftBannersEnabled
+                      ? 'Désactiver le bandeau TV'
+                      : 'Activer le bandeau TV'
+                  }
+                  className={`inline-flex items-center gap-2 px-3.5 py-2.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    leftBannersEnabled
+                      ? 'text-white hover:bg-neutral-800'
+                      : 'text-neutral-400 hover:text-white hover:bg-neutral-800'
+                  }`}
+                >
+                  {leftBannersEnabled ? (
+                    <Eye className="w-3.5 h-3.5 shrink-0" />
+                  ) : (
+                    <EyeOff className="w-3.5 h-3.5 shrink-0" />
+                  )}
+                  <span>
+                    {leftBannersEnabled ? 'Bandeau TV : ON' : 'Bandeau TV : OFF'}
+                  </span>
+                </button>
+
+                {leftBannersEnabled && (
+                  <button
+                    type="button"
+                    onClick={onTriggerLeftBanner}
+                    title="Passer immédiatement au bandeau lien suivant"
+                    className="px-2.5 py-2.5 border-l border-neutral-800 text-neutral-300 hover:text-white hover:bg-neutral-800 transition-colors cursor-pointer inline-flex items-center justify-center"
+                  >
+                    <ChevronRight className="w-3.5 h-3.5 shrink-0" />
+                  </button>
+                )}
+              </div>
+
               <button
                 type="button"
                 onClick={onTriggerFlashBanner}
-                title="Afficher la vignette TV « À suivre » en bas à droite"
+                title="Afficher le bandeau Programmation TV en bas à droite"
                 className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-medium text-neutral-100 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <Bell className="w-3.5 h-3.5 shrink-0" />
-                <span>Bandeau « À suivre »</span>
+                <span>Programmation « À suivre »</span>
               </button>
 
               {activeSource === 'youtube' &&
@@ -603,21 +707,26 @@ export function TvPlayer({
                   </button>
                 )}
 
-              <a
-                href={
+              {(() => {
+                const sourceUrl =
                   activeSource === 'twitch'
                     ? `https://www.twitch.tv/${twitch.channelLogin}`
                     : currentVideo?.twitchVodId
                       ? `https://www.twitch.tv/videos/${currentVideo.twitchVodId}`
-                      : `https://www.youtube.com/watch?v=${currentVideo?.id || ''}`
-                }
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-medium text-neutral-300 hover:text-white bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded-xl transition-colors whitespace-nowrap shrink-0"
-              >
-                <span>Source</span>
-                <ExternalLink className="w-3.5 h-3.5 shrink-0" />
-              </a>
+                      : `https://www.youtube.com/watch?v=${currentVideo?.id || ''}`;
+                return (
+                  <a
+                    href={sourceUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => handleDiscordAwareLinkClick(e, sourceUrl)}
+                    className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-medium text-neutral-300 hover:text-white bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded-xl transition-colors whitespace-nowrap shrink-0"
+                  >
+                    <span>Source</span>
+                    <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                  </a>
+                );
+              })()}
             </div>
           </div>
 
